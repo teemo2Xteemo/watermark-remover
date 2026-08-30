@@ -21,6 +21,15 @@ def test_settings_ignores_empty_env_values(tmp_path: Path) -> None:
     assert settings.log_level == "INFO"
 
 
+def test_settings_tile_size_from_env(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("TILE_SIZE=256\nTILE_OVERLAP=16\n", encoding="utf-8")
+    clear_settings_cache()
+    settings = Settings(_env_file=env_file)
+    assert settings.tile_size == 256
+    assert settings.tile_overlap == 16
+
+
 def test_settings_loads_toml_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

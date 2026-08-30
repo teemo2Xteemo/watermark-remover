@@ -4,7 +4,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import structlog
 
+from watermark_remover.config import get_settings
 from watermark_remover.engines.base import InpaintEngine
 from watermark_remover.engines.tiling import TiledInpaint
 from watermark_remover.exceptions import EngineError, MaskError
@@ -12,8 +14,6 @@ from watermark_remover.masks.base import validate_mask_array
 
 _SEED = 0
 _MODULO = 8
-_TILE_SIZE = 512
-_TILE_OVERLAP = 32
 _INFER_DILATE = 3
 _SETUP_COMMAND = "python scripts/download_models.py"
 
@@ -38,6 +38,33 @@ def _pin_seeds(device: str) -> None:
         pass
 
 
+def _resolve_tile_config(tile_size: int | None, tile_overlap: int | None) -> tuple[int, int]:
+    if tile_size is None or tile_overlap is None:
+        settings = get_settings()
+        if tile_size is None:
+            tile_size = settings.tile_size
+        if tile_overlap is None:
+            tile_overlap = settings.tile_overlap
+    size = int(tile_size)
+    overlap = int(tile_overlap)
+    if size < 1:
+        raise EngineError("tile_size must be >= 1")
+    if overlap < 0:
+        raise EngineError("tile overlap must be >= 0")
+    if overlap >= size:
+        raise EngineError("tile overlap must be smaller than tile_size")
+    return size, overlap
+
+
+def _log_error(event: str, **context: object) -> None:
+    structlog.get_logger("watermark_remover").error(
+        event,
+        engine="lama",
+        exc_info=True,
+        **context,
+    )
+
+
 def _ceil_modulo(value: int, mod: int) -> int:
     remainder = value % mod
     if remainder == 0:
@@ -56,15 +83,29 @@ class _PaddedPass(InpaintEngine):
 
 
 class LaMaInpaintEngine(InpaintEngine):
-    def __init__(self, weights_path: Path, device: str) -> None:
+    def __init__(
+        self,
+        weights_path: Path,
+        device: str,
+        *,
+        tile_size: int | None = None,
+        tile_overlap: int | None = None,
+    ) -> None:
         if device not in {"cpu", "cuda"}:
             raise EngineError(f"unknown LaMa device: {device!r}")
+        self._tile_size, self._tile_overlap = _resolve_tile_config(tile_size, tile_overlap)
         path = Path(weights_path)
         if not path.is_file():
+            structlog.get_logger("watermark_remover").error(
+                "lama_weights_missing",
+                engine="lama",
+                weights=path.name,
+            )
             raise EngineError(f"LaMa weights not found ({path.name}). Run: {_SETUP_COMMAND}")
         try:
             import onnxruntime as ort
         except ImportError as exc:
+            _log_error("lama_onnxruntime_missing", weights=path.name)
             raise EngineError(
                 "onnxruntime is required for LaMa. "
                 "Install with: pip install 'watermark-remover[lama]'"
@@ -79,12 +120,21 @@ class LaMaInpaintEngine(InpaintEngine):
                 str(path), sess_options=session_options, providers=providers
             )
         except Exception as exc:
+            _log_error("lama_weights_load_failed", weights=path.name)
             raise EngineError(f"failed to load LaMa weights ({path.name})") from exc
 
         self._device = device
         self._image_input, self._mask_input = _resolve_input_names(self._session)
         self._output_name = self._session.get_outputs()[0].name
         self._fixed_hw = _fixed_spatial_hw(self._session, self._image_input)
+
+    @property
+    def tile_size(self) -> int:
+        return self._tile_size
+
+    @property
+    def tile_overlap(self) -> int:
+        return self._tile_overlap
 
     def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -103,12 +153,14 @@ class LaMaInpaintEngine(InpaintEngine):
             local = binary[y0:y1, x0:x1] > 0
             result[y0:y1, x0:x1][local] = filled[local]
             return np.ascontiguousarray(result)
-        return TiledInpaint(_TILE_SIZE, _TILE_OVERLAP).process(image, binary, _PaddedPass(self))
+        return TiledInpaint(self._tile_size, self._tile_overlap).process(
+            image, binary, _PaddedPass(self)
+        )
 
     def _window_size(self, height: int, width: int) -> tuple[int, int]:
         if self._fixed_hw is not None:
             return self._fixed_hw
-        return min(_TILE_SIZE, height), min(_TILE_SIZE, width)
+        return min(self._tile_size, height), min(self._tile_size, width)
 
     def _infer_padded(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         orig_h, orig_w = image.shape[:2]
@@ -128,6 +180,11 @@ class LaMaInpaintEngine(InpaintEngine):
                 },
             )
         except Exception as exc:
+            _log_error(
+                "lama_inference_failed",
+                height=int(orig_h),
+                width=int(orig_w),
+            )
             raise EngineError("LaMa ONNX inference failed") from exc
         bgr = _output_to_bgr(outputs[0])[top : top + orig_h, left : left + orig_w]
         result = image.copy()

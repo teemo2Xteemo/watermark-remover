@@ -110,3 +110,20 @@ def test_single_tile_when_image_fits() -> None:
     out = TiledInpaint(tile_size=32, overlap=4).process(image, mask, engine)
     assert engine.calls == [(16, 20)]
     assert out.shape == image.shape
+
+
+def test_default_tile_size_512_splits_image_larger_than_tile() -> None:
+    image = _gradient_image(520, 540)
+    mask = np.full((520, 540), 255, dtype=np.uint8)
+    engine = _ConstantEngine(80)
+    tiled = TiledInpaint()
+    assert tiled.tile_size == 512
+    assert tiled.overlap == 32
+    out = tiled.process(image, mask, engine)
+    assert len(engine.calls) > 1
+    assert all(height <= 512 and width <= 512 for height, width in engine.calls)
+    assert out.shape == image.shape
+    assert out.dtype == np.uint8
+    assert not np.isnan(out.astype(np.float64)).any()
+    assert int(out.min()) >= 0
+    assert int(out.max()) <= 255

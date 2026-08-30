@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import structlog
 
 from watermark_remover.engines.base import InpaintEngine
 from watermark_remover.exceptions import EngineError, MaskError
@@ -56,6 +57,15 @@ class TiledInpaint:
         if height <= self._tile_size and width <= self._tile_size:
             return np.ascontiguousarray(engine.process(image, binary))
 
+        structlog.get_logger("watermark_remover").debug(
+            "tiling_started",
+            engine="tiling",
+            tile_size=self._tile_size,
+            overlap=self._overlap,
+            height=height,
+            width=width,
+        )
+
         acc = np.zeros((height, width, 3), dtype=np.float64)
         weight_sum = np.zeros((height, width), dtype=np.float64)
         y_origins = _tile_origins(height, self._tile_size, self._overlap)
@@ -71,6 +81,14 @@ class TiledInpaint:
                 tile_image = image[y0:y1, x0:x1]
                 inpainted = engine.process(tile_image, tile_mask)
                 if inpainted.shape != tile_image.shape or inpainted.dtype != np.uint8:
+                    structlog.get_logger("watermark_remover").error(
+                        "tiled_engine_bad_output",
+                        engine="tiling",
+                        tile_h=int(tile_image.shape[0]),
+                        tile_w=int(tile_image.shape[1]),
+                        output_dtype=str(inpainted.dtype),
+                        exc_info=True,
+                    )
                     raise EngineError(
                         "tiled engine must return uint8 with the same shape as the tile"
                     )

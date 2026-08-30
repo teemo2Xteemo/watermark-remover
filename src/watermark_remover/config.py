@@ -84,8 +84,16 @@ class Settings(BaseSettings):
     opencv_method: Literal["telea", "ns"] = "telea"
     max_workers: int = Field(default_factory=_cpu_count, ge=1)
     raft_enabled: bool = False
-    tile_size: int = Field(default=512, ge=1)
-    tile_overlap: int = Field(default=32, ge=0)
+    tile_size: int = Field(
+        default=512,
+        ge=1,
+        validation_alias=AliasChoices("TILE_SIZE", "tile_size"),
+    )
+    tile_overlap: int = Field(
+        default=32,
+        ge=0,
+        validation_alias=AliasChoices("TILE_OVERLAP", "tile_overlap"),
+    )
     output_quality: Literal["source", "1080p", "720p"] = "source"
     gradio_server_name: str = "127.0.0.1"
     gradio_share: bool = False

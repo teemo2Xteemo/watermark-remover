@@ -83,7 +83,12 @@ def _same_path(left: Path, right: Path) -> bool:
 
 
 def _lama_engine(settings: Settings) -> LaMaInpaintEngine:
-    return LaMaInpaintEngine(weights_path=resolve_lama_weights(settings), device=_lama_device())
+    return LaMaInpaintEngine(
+        weights_path=resolve_lama_weights(settings),
+        device=_lama_device(),
+        tile_size=settings.tile_size,
+        tile_overlap=settings.tile_overlap,
+    )
 
 
 def _lama_device() -> str:
