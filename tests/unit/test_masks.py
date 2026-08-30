@@ -75,6 +75,25 @@ def test_load_mask_json_rasterizes_and_resizes(tmp_path: Path) -> None:
     assert int(mask.max()) == 255
 
 
+def test_load_mask_json_bbox_matches_width_height(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": 1,
+        "kind": "bbox",
+        "size": [16, 12],
+        "bbox": [3, 2, 5, 4],
+    }
+    src = tmp_path / "box.mask.json"
+    src.write_text(json.dumps(payload), encoding="utf-8")
+    mask = load_mask_json(src, (12, 16))
+    expected = np.zeros((12, 16), dtype=np.uint8)
+    expected[2:6, 3:8] = 255
+    assert np.array_equal(mask, expected)
+    assert int(mask[1, 3]) == 0
+    assert int(mask[2, 8]) == 0
+    assert int(mask[6, 3]) == 0
+    assert int(np.count_nonzero(mask)) == 20
+
+
 def test_load_mask_json_rejects_unknown_major(tmp_path: Path) -> None:
     src = tmp_path / "future.mask.json"
     src.write_text(json.dumps({"schema_version": 99, "kind": "polygon", "size": [2, 2]}))

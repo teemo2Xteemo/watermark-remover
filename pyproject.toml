@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26,<3",
     "opencv-python>=4.9,<5",
-    "pydantic-settings>=2.0",
+    "pydantic-settings[toml]>=2.0",
     "structlog>=24.0",
     "typer>=0.12",
 ]

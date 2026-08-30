@@ -103,7 +103,14 @@ def _rasterize_schema(payload: dict[str, Any], width: int, height: int) -> np.nd
         bbox = payload.get("bbox")
         if isinstance(bbox, list) and len(bbox) == 4 and all(isinstance(v, int) for v in bbox):
             x, y, box_w, box_h = (int(v) for v in bbox)
-            cv2.rectangle(canvas, (x, y), (x + box_w, y + box_h), 255, thickness=-1)
+            if box_w < 1 or box_h < 1:
+                return canvas
+            x0 = max(x, 0)
+            y0 = max(y, 0)
+            x1 = min(x + box_w, width)
+            y1 = min(y + box_h, height)
+            if x1 > x0 and y1 > y0:
+                canvas[y0:y1, x0:x1] = 255
             return canvas
         points = _as_points(payload.get("points"))
         if points.shape[0] >= 2:
