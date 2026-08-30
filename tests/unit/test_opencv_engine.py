@@ -53,17 +53,17 @@ def test_opencv_telea_byte_stable_png(fixtures_dir: Path, tmp_path: Path) -> Non
     assert dest.read_bytes() == baseline
 
 
-def test_get_engine_lama_raises() -> None:
+def test_get_engine_lama_missing_weights(tmp_path: Path) -> None:
     mask = np.zeros((8, 8), dtype=np.uint8)
     mask[1:3, 1:3] = 255
-    with pytest.raises(EngineError, match="LaMa"):
-        get_engine("lama", mask, Settings())
+    with pytest.raises(EngineError, match="download_models"):
+        get_engine("lama", mask, Settings(lama_weights=tmp_path / "missing.onnx"))
 
 
-def test_get_engine_auto_selects_opencv_in_m1() -> None:
-    mask = np.zeros((8, 8), dtype=np.uint8)
-    mask[1:3, 1:3] = 255
-    engine = get_engine("auto", mask, Settings())
+def test_get_engine_auto_selects_opencv_for_small_mask() -> None:
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[0, 0] = 255
+    engine = get_engine("auto", mask, Settings(mask_area_threshold=0.03))
     assert isinstance(engine, OpenCVInpaintEngine)
 
 

@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from watermark_remover.cli import app
-from watermark_remover.config import Settings
+from watermark_remover.config import Settings, clear_settings_cache
 from watermark_remover.exceptions import ResourceLimitError
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.io.image import read_image
@@ -154,7 +154,11 @@ def test_cli_overwrite_required(fixtures_dir: Path, tmp_path: Path) -> None:
     assert allowed.exit_code == 0, allowed.output
 
 
-def test_cli_lama_exit_2(fixtures_dir: Path, tmp_path: Path) -> None:
+def test_cli_lama_exit_2(
+    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LAMA_WEIGHTS", str(tmp_path / "missing.onnx"))
+    clear_settings_cache()
     result = runner.invoke(
         app,
         [
