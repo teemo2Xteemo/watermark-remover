@@ -156,6 +156,77 @@ def test_overlay_mask_rgb_keeps_shape() -> None:
     assert np.array_equal(overlay[0, 0], image[0, 0])
 
 
+def test_preview_mask_from_editor_samples_layers() -> None:
+    from watermark_remover.ui.app import preview_mask_from_editor
+
+    image = np.full((6, 8, 3), 40, dtype=np.uint8)
+    layer = np.zeros((6, 8, 4), dtype=np.uint8)
+    layer[1:3, 2:5, :] = (255, 0, 0, 255)
+    editor = {"background": image, "layers": [layer], "composite": image}
+    mask, overlay, ready, status = preview_mask_from_editor(editor, image, None)
+    assert ready is True
+    assert mask is not None
+    assert int(mask[1, 3]) == 255
+    assert overlay is not None
+    assert overlay.shape == image.shape
+    assert "preview ready" in status
+
+
+def test_preview_mask_from_editor_falls_back_to_current_mask() -> None:
+    from watermark_remover.ui.app import preview_mask_from_editor
+
+    image = np.full((6, 8, 3), 40, dtype=np.uint8)
+    current = np.zeros((6, 8), dtype=np.uint8)
+    current[2:4, 1:3] = 255
+    empty_editor = {"background": image, "layers": [], "composite": image}
+    mask, overlay, ready, _status = preview_mask_from_editor(
+        empty_editor, image, current
+    )
+    assert ready is True
+    assert mask is not None
+    assert int(np.count_nonzero(mask)) == int(np.count_nonzero(current))
+    assert overlay is not None
+
+
+def test_confirm_mask_from_sources_enables_only_with_nonempty_mask() -> None:
+    from watermark_remover.ui.app import confirm_mask_from_sources
+
+    image = np.full((6, 8, 3), 40, dtype=np.uint8)
+    empty_editor = {"background": image, "layers": [], "composite": image}
+    mask, overlay, confirmed, ready, enabled, status = confirm_mask_from_sources(
+        empty_editor, image, None
+    )
+    assert confirmed is False
+    assert enabled is False
+    assert mask is None
+    assert "confirm requires" in status
+
+    current = np.zeros((6, 8), dtype=np.uint8)
+    current[1:3, 1:3] = 255
+    mask, overlay, confirmed, ready, enabled, status = confirm_mask_from_sources(
+        empty_editor, image, current
+    )
+    assert confirmed is True
+    assert ready is True
+    assert enabled is True
+    assert overlay is not None
+    assert "Process All is enabled" in status
+
+
+def test_ui_does_not_subscribe_live_editor_change() -> None:
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "watermark_remover"
+        / "ui"
+        / "app.py"
+    )
+    text = src.read_text(encoding="utf-8")
+    assert "mask_editor.change(" not in text
+    assert "mask_editor.apply(" in text
+    assert "Update preview" in text
+
+
 def test_new_job_id_is_uuid4() -> None:
     value = new_job_id()
     parsed = uuid.UUID(value)
