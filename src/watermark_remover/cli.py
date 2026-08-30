@@ -235,3 +235,14 @@ def main(
             exc_info=True,
         )
         raise typer.Exit(2) from exc
+
+
+@app.command("ui")
+def start_ui() -> None:
+    """Launch the local Gradio Image mode UI (127.0.0.1, share=False)."""
+    from watermark_remover.ui.app import launch
+
+    try:
+        launch()
+    except KeyboardInterrupt as exc:
+        raise typer.Exit(130) from exc
