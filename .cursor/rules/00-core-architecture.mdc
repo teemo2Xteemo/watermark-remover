@@ -1,0 +1,63 @@
+---
+description: Core architecture, directory layout, plugin patterns, and non-negotiable product constraints for the local watermark/object-removal tool.
+alwaysApply: true
+---
+
+# Core Architecture
+
+Local-only object removal / inpainting tool. Watermark is one mask type among logos, overlays, timestamps, and other regions. No cloud AI calls in the processing pipeline.
+
+## Non-negotiables
+
+- **Local-only (NFR1):** never call external AI/inpainting APIs. One-time pretrained weight download at setup is the only allowed network use.
+- **No telemetry (NFR7):** no analytics, crash reporters, or phone-home.
+- **No ownership checks:** do not add license/C2PA/provenance verification.
+- **No platform-specific watermark targeting:** do not detect or specialize for Midjourney, DALL·E, ChatGPT, Adobe Firefly, or similar marks.
+- **No invisible/steganographic watermarks** (C2PA, fingerprints) — out of scope.
+- **Auto-detect never auto-applies.** Return `MaskCandidate`s with confidence; require explicit confirm/edit before inpaint.
+- **Never overwrite the input path** unless the user passes an explicit flag. Default output: `{stem}_inpainted{suffix}`.
+- **Reproducible:** same input + mask + engine config → same output. Fix RNG seeds.
+
+## Directory layout
+
+```
+src/watermark_remover/
+  cli.py                 # typer entry
+  config.py              # pydantic-settings only
+  exceptions.py
+  io/                    # image + video read/validate
+  masks/                 # MaskProvider ABC + manual/auto + serialize
+  engines/               # InpaintEngine ABC + opencv/lama + tiling
+  video/                 # extract, temporal consistency, re-encode
+  batch.py
+  ui/app.py              # Gradio only
+tests/{unit,integration,fixtures}/
+models/                  # pretrained weights; gitignored
+scripts/download_models.py
+```
+
+Do not invent `api/`, `routes/`, `orm/`, or a database layer.
+
+## Patterns
+
+- Plugin ABCs only: `MaskProvider.get_mask(frame, frame_idx) -> np.ndarray` and `InpaintEngine.process(image, mask) -> np.ndarray`.
+- New engines register in `engines/registry.py`. Do not hardcode `if engine == ...` outside the selector.
+- Pipeline: Input → Mask acquisition → Inpaint → (video: optical flow) → Output.
+- Config via env/`config.toml` through pydantic-settings. No hardcoded paths, RAM/VRAM limits, or size caps.
+- Types: Python 3.10+, `from __future__ import annotations`, numpy `ndarray` shapes documented in docstrings.
+
+## Naming
+
+| Kind | Convention | Example |
+|------|------------|---------|
+| Packages/modules | snake_case | `lama_engine.py` |
+| Classes | PascalCase + role suffix | `LaMaInpaintEngine`, `ManualMaskProvider` |
+| Functions | snake_case verbs | `extract_frames`, `get_mask` |
+| Constants | UPPER_SNAKE | `MAX_VIDEO_BYTES` |
+| CLI flags | kebab-case | `--input`, `--engine`, `--output` |
+| Output files | `{stem}_inpainted.ext` | `clip_inpainted.mp4` |
+| Mask files | `{stem}.mask.png` / `{stem}.mask.json` | |
+
+## Errors
+
+Raise typed exceptions from `exceptions.py` (`InputValidationError`, `MaskError`, `EngineError`, `ResourceLimitError`). No bare `except:` / swallowed errors. Log with `exc_info` and a structured context dict (`input_path`, `frame_idx`, `engine`).

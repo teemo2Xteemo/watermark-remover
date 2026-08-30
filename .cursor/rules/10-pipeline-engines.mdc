@@ -1,0 +1,80 @@
+---
+description: Processing pipeline, MaskProvider/InpaintEngine contracts, I/O validation, CLI exit codes, and OpenCV/LaMa conventions.
+globs: src/watermark_remover/**/*.py
+alwaysApply: false
+---
+
+# Pipeline & Engines
+
+Applies to core library and CLI. Exclude UI-only changes unless they call these APIs.
+
+## Layering
+
+```
+cli.py / ui/app.py
+    → VideoProcessor | ImageProcessor | BatchRunner
+        → MaskProvider
+        → InpaintEngine (+ optional TiledInpaint)
+        → TemporalSmoother (video only)
+        → ffmpeg encode (preserve audio, fps, CRF)
+```
+
+- CLI and Gradio are thin adapters. Business logic stays in processors/providers/engines.
+- Do not import Gradio from `engines/`, `masks/`, `io/`, or `video/`.
+
+## Contracts
+
+```python
+class MaskProvider(ABC):
+    def get_mask(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Binary mask uint8, {0, 255}, same HxW as frame."""
+
+class InpaintEngine(ABC):
+    def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """BGR uint8 image in/out. Mask uint8 {0, 255}."""
+```
+
+- Masks: `dtype=uint8`, values `{0, 255}` only. Validate shape == image `[:2]`. Reject empty (all 0) and full (all 255) unless `--allow-empty-mask` / `--allow-full-mask`.
+- Images: BGR `uint8` at engine boundary (OpenCV). Convert RGB only at Pillow/Gradio edges.
+- `AutoDetectMaskProvider.detect_candidates(...)` returns `list[MaskCandidate]` (`mask`, `confidence: float`, `method: str`, `bbox`). Never writes a final mask without confirmation.
+
+## Detection (in-scope only)
+
+Allowed: `cv2.matchTemplate` (user-supplied PNG+alpha), static-region via frame differencing, local edge/contrast heuristics. Session-only threshold refine from user yes/no feedback.
+
+Forbidden: pretrained detectors that classify a watermark *brand/platform*; cloud APIs; training a custom detector in phase 1.
+
+## Engines
+
+| Engine | When | Config |
+|--------|------|--------|
+| `OpenCVInpaintEngine` | small mask, simple background, speed | `radius`, `method` in `{telea, ns}` |
+| `LaMaInpaintEngine` | large/complex masks | local ONNX or PyTorch weights; CPU or CUDA |
+
+- Auto-select: mask area `< mask_area_threshold` (config, default ~3%) → OpenCV, else LaMa. User `--engine` always wins.
+- Huge frames: tile via `engines/tiling.py` with overlap; never load unbounded tensors.
+- LaMa: load weights from `models/` (config path). Fail fast with `EngineError` if missing — do not download mid-run.
+- Fix seeds (`torch.manual_seed`, numpy, CUDA) when the engine is stochastic.
+
+## I/O & limits
+
+- Images: JPG, PNG, WEBP via OpenCV/Pillow. Videos: MP4, MOV, WEBM (H.264/H.265) via ffmpeg-python or `VideoCapture`.
+- Reject/warn when `size > max_input_bytes` (default 2GiB) or resolution exceeds config **before** decode/process.
+- Video metadata required: fps, resolution, duration, codec. Re-encode must keep original audio track, fps, and comparable quality (`crf` / bitrate from config).
+- Parallel frame batches: `ProcessPoolExecutor` or multiprocessing, `max_workers <= cpu_count`. Honor RAM/VRAM caps; stop with `ResourceLimitError` rather than OOM.
+
+## CLI
+
+```text
+watermark-remover --input PATH --mask PATH|auto --engine opencv|lama|auto --output PATH
+```
+
+Exit codes: `0` ok · `1` validation · `2` process · `3` resource · `130` cancel.
+
+Progress: callback / tqdm for long video (`percent`, `frame_idx`, `fps_throughput`).
+
+## Queries / array work
+
+- Prefer vectorized OpenCV/numpy. No Python per-pixel loops on frames.
+- Do not keep all video frames in RAM; stream extract → process → write (temp dir, then mux).
+- Optical flow: Farneback default; RAFT optional behind a flag. Apply only to inpainted regions to reduce flicker.

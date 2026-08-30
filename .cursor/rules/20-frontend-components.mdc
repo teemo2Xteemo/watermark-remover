@@ -1,0 +1,62 @@
+---
+description: Gradio local UI structure, mask-drawing UX, preview/confirm flow, and frontend state conventions.
+globs: src/watermark_remover/ui/**/*.py
+alwaysApply: false
+---
+
+# Gradio UI
+
+Local Gradio app only (`src/watermark_remover/ui/`). No React, no Streamlit unless replacing Gradio wholesale. No remote share (`share=False`). Bind `127.0.0.1`.
+
+## Layout
+
+Use `gr.Blocks` with named sections, not a single kitchen-sink `Interface`:
+
+1. **Input** — image/video upload (JPG/PNG/WEBP, MP4/MOV/WEBM)
+2. **Mask** — draw bbox / freehand; or auto-detect candidates
+3. **Preview** — overlay before run
+4. **Engine** — `opencv` | `lama` | `auto` + advanced params
+5. **Run / progress / download**
+
+Keep event handlers thin: validate → call processors → update components. No inpaint math inside click callbacks.
+
+```python
+# ✅ GOOD
+def on_run(image, mask, engine_name, config):
+    mask_u8 = ui_mask_to_uint8(mask)
+    return image_processor.process(image, mask_u8, engine_name, config)
+
+# ❌ BAD — cv2.inpaint / model inference inside the Gradio file
+```
+
+## Mask UX (FR2 / FR3)
+
+- Support bounding box and freehand/polygon via Gradio ImageEditor / sketch.
+- Video: mask on first shown frame. Toggle **static mask (all frames)** vs **keyframe masks at timestamps**.
+- Auto-detect shows **candidates + confidence**. User must accept/edit before Enable Run.
+- Disable the Run button until a confirmed mask exists (manual draw or accepted candidate).
+- Preview overlay is mandatory before inpaint.
+
+## State
+
+- Session state in `gr.State` (mask, candidates, thresholds, keyframes). Do not use module-level mutable globals.
+- Threshold feedback (yes/no) updates **this session only** — persist nothing to disk unless the user exports.
+- Export/import: PNG mask (`{stem}.mask.png`) and JSON polygons (`{stem}.mask.json`). Round-trip must restore the same mask.
+
+## Props / types
+
+- Annotate every handler: `np.ndarray | None`, `Path | str`, literals for engine.
+- Normalize Gradio RGB → BGR before processors; BGR → RGB before display.
+- Video preview: downsample / short window for preview; full-res only on Run.
+
+## Performance
+
+- Do not decode entire videos into memory for the UI.
+- Show progress via `gr.Progress` or a status markdown bound to the processor callback.
+- LaMa CPU warning visible when CUDA is unavailable.
+- Batch folder mode: list files + shared mask/template; do not render every frame thumbnail at once.
+
+## Styling
+
+- Minimal custom CSS. Prefer Gradio native layout (`Row`/`Column`/`Accordion` for advanced engine params).
+- Do not add auth, cloud upload, or “share to gallery” features.

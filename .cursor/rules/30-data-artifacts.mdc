@@ -1,0 +1,63 @@
+---
+description: File-based artifact rules for masks, model weights, outputs, and atomic writes. This project has no database or ORM.
+globs: src/watermark_remover/io/**/*.py,src/watermark_remover/masks/**/*.py,src/watermark_remover/config.py,scripts/**/*.py
+alwaysApply: false
+---
+
+# Data & Artifacts
+
+There is **no SQL database, ORM, or migration runner**. Persist only files: inputs (read-only), masks, outputs, and local model weights.
+
+## What may be written
+
+| Artifact | Location | Format | Notes |
+|----------|----------|--------|--------|
+| Output media | `--output` or `{stem}_inpainted.ext` | same container/codec family as input | never default to input path |
+| Binary mask | `{stem}.mask.png` | uint8 PNG, `{0,255}`, same HxW | optional `--export-mask` |
+| Vector mask | `{stem}.mask.json` | polygon/bbox + frame/ts | versioned schema |
+| Keyframe masks | `{stem}.keyframes.json` | list of `{t, mask_ref}` | video only |
+| Model weights | `models/` (gitignored) | ONNX/PTH | setup script only |
+| Temp frames | `tempfile.TemporaryDirectory` | — | always cleaned up |
+
+Do not write SQLite “for convenience”, caches of user media, or sidecar telemetry.
+
+## Mask JSON schema
+
+```json
+{
+  "schema_version": 1,
+  "kind": "polygon",
+  "size": [1920, 1080],
+  "points": [[x, y], "..."],
+  "closed": true
+}
+```
+
+- Bump `schema_version` on breaking changes; readers must reject unknown major versions or migrate explicitly in `masks/serialize.py`.
+- PNG mask is source of truth for pixels. JSON is for edit/reuse. Importing JSON rasterizes at stated `size`, then resize-nearest to the frame.
+
+## Integrity
+
+- Validate magic/format and dimensions **before** full decode when possible.
+- Atomic output: write `output.tmp` (or ffmpeg temp) → `fsync` → `replace` onto the final path. Never leave a truncated file at the user-facing path on failure.
+- Treat input as immutable. Copy-on-write only if a backend requires a seekable local file.
+- Video: mux original audio; do not drop or re-encode audio unless ffmpeg requires a copy (`-c:a copy`).
+
+## Model weights
+
+- Path from config (`MODEL_DIR`, `LAMA_WEIGHTS`). Never hardcode user home paths.
+- `scripts/download_models.py` is the only downloader: checksum (SHA256) required, write to `models/`, refuse overwrite without `--force`.
+- Runtime engines **must not** download. Missing weights → `EngineError` with the setup command.
+
+## Indexing / lookup
+
+- Batch mode: iterate the input folder with a deterministic sort. Pair masks by stem: `foo.jpg` ↔ `foo.mask.png`.
+- No in-memory index of an entire library. Do not watch filesystems.
+
+## Transactions analog
+
+A job is one unit: on failure, delete partial output and keep temp dirs out of the destination folder. Log `job_id` (uuid4) on every line for that run.
+
+## Config as the only “schema”
+
+Resource caps live in pydantic-settings (`max_input_bytes`, `max_ram_mb`, `max_vram_mb`, `mask_area_threshold`, `crf`). Changing defaults is a config change, not a data migration.

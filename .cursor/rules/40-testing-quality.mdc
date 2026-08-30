@@ -1,0 +1,68 @@
+---
+description: pytest layout, fixture rules, SSIM/PSNR baselines, and coverage expectations for engines, detectors, and video I/O.
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Testing
+
+`pytest` + `pytest-cov`. Tests live under `tests/`. Do not put tests inside `src/`.
+
+## Layout
+
+```
+tests/conftest.py
+tests/fixtures/          # tiny PNG/MP4 + masks (checked in, few KB)
+tests/unit/              # engines, masks, io, selector — no ffmpeg if avoidable
+tests/integration/       # short ~5s clip, CLI, Gradio optional smoke
+```
+
+Name files `test_<module>.py`, cases `test_<behavior>`.
+
+## Unit — engines
+
+- Each `InpaintEngine`: fixed fixture image + mask → compare to committed baseline with **SSIM ≥ threshold** and **PSNR ≥ threshold** (store thresholds in the test, not magic in production code).
+- Pin seeds. Mark GPU tests `@pytest.mark.gpu` and skip without CUDA.
+- Mock LaMa weights with a tiny stub tensor/ONNX in unit tests; real weights only in optional `@pytest.mark.slow`.
+
+```python
+# ✅ compare structure, not exact bytes if codec noise exists
+assert ssim(out, baseline) >= 0.95
+```
+
+## Unit — auto-detect
+
+- Fixture set: watermark at varied position/scale. Assert precision/recall of **candidates vs ground-truth mask** (IoU ≥ configured min).
+- Never assert that a candidate is auto-applied.
+
+## Integration — video
+
+- Clip ~5s in `tests/fixtures/`. Assert: audio stream present, fps equals input (±epsilon), exit 0, no crash when the mask moves (keyframe fixture).
+- Fake ffmpeg only in unit tests; integration must call real ffmpeg if present, else `@pytest.mark.skipif(not has_ffmpeg)`.
+
+## Edge cases (required)
+
+| Case | Expect |
+|------|--------|
+| Empty mask | `MaskError` unless allow flag |
+| Full-image mask | `MaskError` or documented engine behavior + test |
+| Tiny / huge resolution | reject or tile; no crash |
+| Oversize file | `InputValidationError` before heavy decode |
+| Missing LaMa weights | `EngineError`, no network |
+| Output path == input | refuse without `--overwrite` |
+
+## Mocking
+
+- Mock network (`respx`/`unittest.mock`) — any test that would open a socket must fail.
+- Do not mock `InpaintEngine.process` in that engine’s own unit tests.
+- Time/progress: inject a clock/callback; do not `sleep` in tests.
+
+## Coverage & TDD
+
+- New engine/provider: write the failing contract test first (`process` shape/dtype, `get_mask` 0/255).
+- Target: ≥80% on `src/watermark_remover/{engines,masks,io}`; do not chase 100% on Gradio layout.
+- CI runs `pytest -m "not slow and not gpu"` by default.
+
+## Determinism
+
+Assert byte-stable PNG outputs for OpenCV Telea on the fixture. If an encoder is non-deterministic, compare metrics, not hashes.

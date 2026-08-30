@@ -1,0 +1,59 @@
+---
+description: Secret hygiene, local-only networking, Docker/CI, logging, and resource-safe deployment for the inpainting tool.
+globs: "**/{Dockerfile*,docker-compose*.yml,*.yaml,*.yml,.env*,config.py,logging*.py,pyproject.toml}"
+alwaysApply: false
+---
+
+# Security & DevOps
+
+## Secrets & config
+
+- No secrets in git. `.env` is optional and gitignored; document `.env.example` with empty values only.
+- All tunables via pydantic-settings / env: `MAX_INPUT_BYTES`, `MODEL_DIR`, `LAMA_WEIGHTS`, `MAX_RAM_MB`, `MAX_VRAM_MB`, `CRF`.
+- Never hardcode API keys, webhook URLs, or download tokens in Python.
+
+```python
+# ❌ BAD
+WEIGHTS_URL = "https://example.com/weights?token=abc"
+
+# ✅ GOOD
+settings = get_settings()  # MODEL_DIR from env
+```
+
+## Auth / exposure
+
+- No user accounts, JWT, or OAuth in phase 1.
+- Gradio: `server_name="127.0.0.1"`, `share=False`, no `auth` unless later required. Do not enable `gradio.tunnel` / public links.
+- CLI is a local process. Do not add HTTP APIs that bind `0.0.0.0` by default.
+
+## Local-only pipeline
+
+- Processing code must not use `requests`/`httpx`/`urllib` except `scripts/download_models.py`.
+- Add a test or lint guard: engines/masks/video/io import graph cannot reach HTTP clients.
+- No Sentry, Segment, OpenTelemetry exporters, or crash-upload.
+
+## Docker
+
+- Two images: `Dockerfile` (CUDA runtime, documented base) and `Dockerfile.cpu`.
+- Non-root user. Copy only `src/`, `scripts/`, `pyproject.toml` / `requirements.txt`. Weights via volume ` /models`.
+- Pin base digests or major.minor tags. `ffmpeg` installed in-image.
+- `.dockerignore`: `.git`, `tests/fixtures` large media, `models/*.pth`, `.venv`.
+- Compose: bind-mount input/output dirs; no published ports except optional `127.0.0.1:7860:7860`.
+
+## CI
+
+- Lint (`ruff`), typecheck (`mypy`), `pytest -m "not slow and not gpu"`.
+- Do not download LaMa weights in default CI. Cache optional slow jobs separately.
+- Fail CI if `ruff` finds `# noqa` abuse or if tests open the network (`pytest-socket`).
+
+## Logging
+
+- `structlog` or stdlib with JSON in non-tty. Fields: `job_id`, `engine`, `frame_idx`, `duration_ms`. **Never** log file *contents* or full user paths if avoidable — prefer basename.
+- Levels: INFO job start/end; DEBUG per-frame only when `LOG_LEVEL=DEBUG`.
+- No `print` in library code.
+
+## Resources
+
+- Enforce `max_ram_mb` / `max_vram_mb` before engine init. Prefer tile/downscale over crash.
+- Multiprocessing `spawn` on Windows. Cap `max_workers`.
+- Catch `KeyboardInterrupt` → exit 130, clean temp dirs in `finally`.

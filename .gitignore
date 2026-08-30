@@ -1,0 +1,29 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+.cursor/mcp.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights (downloaded locally; not committed)
+models/*.pth
+models/*.pt
+models/*.onnx
+models/*.ckpt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
