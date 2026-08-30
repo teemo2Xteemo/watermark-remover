@@ -31,7 +31,12 @@ from watermark_remover.io.validate import (
     validate_resolution_limits,
     validate_size_limits,
 )
-from watermark_remover.masks.base import validate_mask_array
+from watermark_remover.masks.auto_detect import (
+    AutoDetectMaskProvider,
+    load_template,
+    template_to_display_rgb,
+)
+from watermark_remover.masks.base import MaskCandidate, validate_mask_array
 from watermark_remover.masks.serialize import (
     export_mask_json,
     export_mask_png,
@@ -97,6 +102,136 @@ def is_run_enabled(
     except MaskError:
         return False
     return int(np.count_nonzero(binary)) > 0
+
+
+def format_candidate_label(index: int, confidence: float) -> str:
+    percent = int(round(float(np.clip(confidence, 0.0, 1.0)) * 100.0))
+    return f"Candidate {index + 1}  {percent}%"
+
+
+def candidates_to_labels(candidates: list[MaskCandidate] | None) -> list[str]:
+    return [
+        format_candidate_label(index, candidate.confidence)
+        for index, candidate in enumerate(candidates or [])
+    ]
+
+
+def parse_candidate_index(label: str | None, count: int) -> int | None:
+    if not label or count <= 0:
+        return None
+    match = re.match(r"Candidate\s+(\d+)", str(label))
+    if not match:
+        return None
+    index = int(match.group(1)) - 1
+    if 0 <= index < count:
+        return index
+    return None
+
+
+def detect_ui_candidates(
+    image_rgb: np.ndarray | None,
+    template_file: object | None,
+    sensitivity: float,
+    threshold_bias: float = 0.0,
+) -> tuple[list[MaskCandidate], str]:
+    if image_rgb is None:
+        return [], "Status: waiting for input"
+    template: np.ndarray | None = None
+    template_path = _as_path(template_file)
+    if template_path is not None:
+        try:
+            template = load_template(template_path)
+        except (MaskError, OSError) as exc:
+            return [], f"Status: {exc}"
+    provider = AutoDetectMaskProvider(
+        template=template,
+        sensitivity=float(sensitivity),
+        threshold_bias=float(threshold_bias),
+    )
+    candidates = provider.detect_candidates(rgb_to_bgr(_as_rgb(image_rgb)), 0)
+    if template is not None and not candidates:
+        peak = provider.last_template_peak
+        need = provider.match_threshold()
+        if peak is None:
+            return [], "Status: template could not be matched (too large or invalid)"
+        return [], (
+            f"Status: template did not match (best {peak:.0%}, need ≥ {need:.0%}). "
+            "Raise Sensitivity or crop the logo tighter."
+        )
+    if not candidates:
+        return [], "Status: no candidates — upload a template crop of the watermark"
+    if template is None:
+        return candidates, (
+            f"Status: {len(candidates)} heuristic candidate(s) — "
+            "upload a template for better accuracy. Accept or Reject before run"
+        )
+    return candidates, (
+        f"Status: {len(candidates)} candidate(s) — Accept or Reject before run"
+    )
+
+
+def template_preview_from_file(
+    file_value: object | None,
+) -> tuple[np.ndarray | None, str]:
+    path = _as_path(file_value)
+    if path is None:
+        return None, "Status: no template"
+    try:
+        template = load_template(path)
+    except (MaskError, OSError) as exc:
+        return None, f"Status: {exc}"
+    preview = template_to_display_rgb(template)
+    height, width = preview.shape[:2]
+    return preview, f"Status: template loaded ({width}×{height})"
+
+
+def accept_ui_candidate(
+    label: str | None,
+    candidates: list[MaskCandidate] | None,
+    image_rgb: np.ndarray | None,
+    threshold_bias: float = 0.0,
+) -> tuple[np.ndarray | None, np.ndarray | None, bool, bool, bool, float, str]:
+    rows = list(candidates or [])
+    index = parse_candidate_index(label, len(rows))
+    if image_rgb is None:
+        return None, None, False, False, False, threshold_bias, "Status: waiting for input"
+    if index is None:
+        return (
+            None,
+            None,
+            False,
+            False,
+            False,
+            threshold_bias,
+            "Status: select a candidate to accept",
+        )
+    provider = AutoDetectMaskProvider(threshold_bias=threshold_bias)
+    mask = provider.confirm_candidate(rows[index])
+    overlay = overlay_mask_rgb(image_rgb, mask)
+    enabled = is_run_enabled(mask, True, True)
+    return (
+        mask,
+        overlay,
+        True,
+        True,
+        enabled,
+        provider.threshold_bias,
+        "Status: candidate accepted — Process All is enabled",
+    )
+
+
+def reject_ui_candidate(
+    label: str | None,
+    candidates: list[MaskCandidate] | None,
+    threshold_bias: float = 0.0,
+) -> tuple[list[MaskCandidate], float, str]:
+    rows = list(candidates or [])
+    index = parse_candidate_index(label, len(rows))
+    if index is None:
+        return rows, threshold_bias, "Status: select a candidate to reject"
+    provider = AutoDetectMaskProvider(threshold_bias=threshold_bias)
+    provider.reject_candidate(rows.pop(index))
+    return rows, provider.threshold_bias, "Status: candidate rejected"
 
 
 def overlay_mask_rgb(image: np.ndarray, mask: np.ndarray | dict[str, Any] | None) -> np.ndarray:
@@ -645,6 +780,9 @@ def build_app(settings: Settings | None = None) -> Any:
                 disabled,
                 f"Status: {exc}",
                 None,
+                [],
+                gr.update(choices=[], value=None),
+                0.0,
             )
         editor = _editor_value(rgb, None)
         return (
@@ -658,6 +796,9 @@ def build_app(settings: Settings | None = None) -> Any:
             disabled,
             "Status: input loaded — draw or import a mask",
             rgb,
+            [],
+            gr.update(choices=[], value=None),
+            0.0,
         )
 
     def on_update_preview(
@@ -830,6 +971,85 @@ def build_app(settings: Settings | None = None) -> Any:
             job.status,
         )
 
+    def on_detection_mode(mode: str) -> Any:
+        return gr.update(visible=str(mode) == "Auto")
+
+    def on_run_detection(
+        image_rgb: np.ndarray | None,
+        template_file: object,
+        sensitivity_value: float,
+        bias: float,
+    ) -> tuple[Any, ...]:
+        candidates, status_text = detect_ui_candidates(
+            image_rgb,
+            template_file,
+            float(sensitivity_value if sensitivity_value is not None else 50),
+            float(bias or 0.0),
+        )
+        labels = candidates_to_labels(candidates)
+        radio = gr.update(choices=labels, value=labels[0] if labels else None)
+        return candidates, radio, False, _run_update(False), status_text
+
+    def on_accept_candidate(
+        label: str | None,
+        candidates: list[MaskCandidate] | None,
+        image_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        confirmed: bool,
+        preview_ready_flag: bool,
+        bias: float,
+    ) -> tuple[Any, ...]:
+        mask, overlay, new_confirmed, ready, enabled, new_bias, status_text = (
+            accept_ui_candidate(label, candidates, image_rgb, float(bias or 0.0))
+        )
+        if not enabled or mask is None or image_rgb is None:
+            return (
+                current_mask,
+                gr.update(),
+                overlay,
+                confirmed,
+                preview_ready_flag,
+                _run_update(is_run_enabled(current_mask, confirmed, preview_ready_flag)),
+                new_bias,
+                status_text,
+            )
+        editor = _editor_value(_as_rgb(image_rgb), mask)
+        return (
+            mask,
+            editor,
+            overlay,
+            new_confirmed,
+            ready,
+            _run_update(True),
+            new_bias,
+            status_text,
+        )
+
+    def on_reject_candidate(
+        label: str | None,
+        candidates: list[MaskCandidate] | None,
+        mask: np.ndarray | None,
+        confirmed: bool,
+        preview_ready_flag: bool,
+        bias: float,
+    ) -> tuple[Any, ...]:
+        remaining, new_bias, status_text = reject_ui_candidate(
+            label, candidates, float(bias or 0.0)
+        )
+        labels = candidates_to_labels(remaining)
+        value = None
+        if labels:
+            previous = parse_candidate_index(label, len(candidates or []))
+            pick = 0 if previous is None else min(previous, len(labels) - 1)
+            value = labels[pick]
+        return (
+            remaining,
+            gr.update(choices=labels, value=value),
+            new_bias,
+            _run_update(is_run_enabled(mask, confirmed, preview_ready_flag)),
+            status_text,
+        )
+
     with gr.Blocks(
         title="watermark-remover",
         analytics_enabled=False,
@@ -841,6 +1061,8 @@ def build_app(settings: Settings | None = None) -> Any:
         input_stem = gr.State("image")
         input_path_state = gr.State(None)
         sensitivity = gr.State(50)
+        candidates_state = gr.State([])
+        threshold_bias = gr.State(0.0)
         job_temp_state = gr.State(None)
         cancel_state = gr.State({"requested": False})
 
@@ -869,7 +1091,13 @@ def build_app(settings: Settings | None = None) -> Any:
             gr.Markdown("## Mask")
             gr.Markdown(
                 "Draw freehand or add a bounding box, then Update preview. "
+                "In Auto mode, run detection and Accept or Reject each candidate. "
                 "Import/export uses `{stem}.mask.png` and `{stem}.mask.json`."
+            )
+            detection_mode = gr.Radio(
+                label="Detection Mode",
+                choices=["Manual", "Auto"],
+                value="Manual",
             )
             mask_editor = gr.ImageEditor(
                 label="Mask editor (freehand)",
@@ -892,6 +1120,42 @@ def build_app(settings: Settings | None = None) -> Any:
                 bbox_w = gr.Number(label="BBox width", value=32, precision=0)
                 bbox_h = gr.Number(label="BBox height", value=32, precision=0)
             add_bbox_btn = gr.Button("Add bounding box")
+            with gr.Group(visible=False) as auto_group:
+                gr.Markdown("### Auto-detect")
+                gr.Markdown(
+                    "Crop the watermark tightly (PNG with transparency works best). "
+                    "Without a template, heuristics often pick photo details instead."
+                )
+                with gr.Row():
+                    template_file = gr.File(
+                        label="Upload watermark template (PNG/JPG)",
+                        file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                        file_count="single",
+                        type="filepath",
+                    )
+                    template_preview = gr.Image(
+                        label="Template preview",
+                        type="numpy",
+                        interactive=False,
+                        height=160,
+                        buttons=["fullscreen"],
+                    )
+                sensitivity_slider = gr.Slider(
+                    label="Sensitivity",
+                    minimum=1,
+                    maximum=100,
+                    value=50,
+                    step=1,
+                )
+                run_detection_btn = gr.Button("Run Detection")
+                candidate_radio = gr.Radio(
+                    label="Candidates",
+                    choices=[],
+                    value=None,
+                )
+                with gr.Row():
+                    accept_btn = gr.Button("Accept")
+                    reject_btn = gr.Button("Reject")
             with gr.Row():
                 mask_import = gr.File(
                     label="Import mask (.png / .json)",
@@ -923,7 +1187,7 @@ def build_app(settings: Settings | None = None) -> Any:
                 choices=["opencv", "lama", "auto"],
                 value="opencv",
             )
-            gpu_md = gr.Markdown(gpu_status)
+            gr.Markdown(gpu_status)
             with gr.Accordion("Advanced Settings", open=False):
                 radius = gr.Number(label="radius", value=settings.opencv_radius, precision=0)
                 method = gr.Radio(
@@ -956,8 +1220,6 @@ def build_app(settings: Settings | None = None) -> Any:
             download = gr.File(label="Download result")
             status = gr.Markdown("Status: Waiting for input")
 
-        _ = (sensitivity, gpu_md)
-
         input_file.upload(
             on_open_file,
             inputs=[input_file],
@@ -972,6 +1234,75 @@ def build_app(settings: Settings | None = None) -> Any:
                 run_btn,
                 status,
                 input_preview,
+                candidates_state,
+                candidate_radio,
+                threshold_bias,
+            ],
+        )
+        detection_mode.change(
+            on_detection_mode,
+            inputs=[detection_mode],
+            outputs=[auto_group],
+        )
+        template_file.change(
+            template_preview_from_file,
+            inputs=[template_file],
+            outputs=[template_preview, status],
+        )
+        sensitivity_slider.change(
+            lambda value: float(value),
+            inputs=[sensitivity_slider],
+            outputs=[sensitivity],
+        )
+        run_detection_btn.click(
+            on_run_detection,
+            inputs=[image_state, template_file, sensitivity_slider, threshold_bias],
+            outputs=[
+                candidates_state,
+                candidate_radio,
+                mask_confirmed,
+                run_btn,
+                status,
+            ],
+        )
+        accept_btn.click(
+            on_accept_candidate,
+            inputs=[
+                candidate_radio,
+                candidates_state,
+                image_state,
+                mask_state,
+                mask_confirmed,
+                preview_ready,
+                threshold_bias,
+            ],
+            outputs=[
+                mask_state,
+                mask_editor,
+                preview_image,
+                mask_confirmed,
+                preview_ready,
+                run_btn,
+                threshold_bias,
+                status,
+            ],
+        )
+        reject_btn.click(
+            on_reject_candidate,
+            inputs=[
+                candidate_radio,
+                candidates_state,
+                mask_state,
+                mask_confirmed,
+                preview_ready,
+                threshold_bias,
+            ],
+            outputs=[
+                candidates_state,
+                candidate_radio,
+                threshold_bias,
+                run_btn,
+                status,
             ],
         )
         preview_inputs = [

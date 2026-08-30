@@ -171,6 +171,25 @@ def test_cli_lama_exit_2(fixtures_dir: Path, tmp_path: Path) -> None:
     assert result.exit_code == 2
 
 
+def test_cli_mask_auto_never_applies(fixtures_dir: Path, tmp_path: Path) -> None:
+    output = tmp_path / "should_not_exist.png"
+    result = runner.invoke(
+        app,
+        [
+            "--input",
+            str(fixtures_dir / "still_logo.png"),
+            "--mask",
+            "auto",
+            "--output",
+            str(output),
+        ],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()
+    text = f"{result.output}\n{result.stderr}\n{result.exception}"
+    assert "never auto-applies" in text
+
+
 def test_cli_missing_input_exit_1() -> None:
     result = runner.invoke(app, ["--mask", "x.png"])
     assert result.exit_code == 1

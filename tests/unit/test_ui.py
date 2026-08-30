@@ -13,16 +13,23 @@ from watermark_remover.config import Settings
 from watermark_remover.exceptions import InputValidationError, MaskError
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.ui.app import (
+    accept_ui_candidate,
     bgr_to_rgb,
+    candidates_to_labels,
     cuda_available,
+    detect_ui_candidates,
+    format_candidate_label,
     is_run_enabled,
     lama_cpu_warning_message,
     launch_kwargs,
     new_job_id,
     on_run,
     overlay_mask_rgb,
+    parse_candidate_index,
+    reject_ui_candidate,
     rgb_to_bgr,
     run_image_job,
+    template_preview_from_file,
     ui_mask_to_uint8,
 )
 
@@ -79,6 +86,90 @@ def test_run_disabled_without_confirmed_mask_or_preview() -> None:
     empty = np.zeros((8, 8), dtype=np.uint8)
     assert is_run_enabled(empty, mask_confirmed=True, preview_ready=True) is False
     assert is_run_enabled(mask, mask_confirmed=True, preview_ready=True) is True
+
+
+def test_format_and_parse_candidate_labels() -> None:
+    assert format_candidate_label(0, 0.87) == "Candidate 1  87%"
+    assert parse_candidate_index("Candidate 1  87%", 3) == 0
+    assert parse_candidate_index("Candidate 2  40%", 3) == 1
+    assert parse_candidate_index("Candidate 9  10%", 2) is None
+    assert parse_candidate_index(None, 1) is None
+    assert candidates_to_labels([]) == []
+
+
+def test_detect_ui_candidates_does_not_enable_run(fixtures_dir: Path) -> None:
+    from watermark_remover.io.image import read_image
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "detect_pos1.png"))
+    candidates, status = detect_ui_candidates(
+        rgb,
+        fixtures_dir / "template_logo.png",
+        sensitivity=50,
+    )
+    assert candidates
+    assert "Accept or Reject" in status
+    assert is_run_enabled(candidates[0].mask, mask_confirmed=False, preview_ready=True) is False
+
+
+def test_accept_ui_candidate_enables_run(fixtures_dir: Path) -> None:
+    from watermark_remover.io.image import read_image
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "detect_pos1.png"))
+    candidates, _status = detect_ui_candidates(
+        rgb,
+        fixtures_dir / "template_logo.png",
+        sensitivity=50,
+    )
+    label = format_candidate_label(0, candidates[0].confidence)
+    mask, overlay, confirmed, ready, enabled, bias, status = accept_ui_candidate(
+        label, candidates, rgb, 0.0
+    )
+    assert confirmed is True
+    assert ready is True
+    assert enabled is True
+    assert mask is not None
+    assert overlay is not None
+    assert is_run_enabled(mask, confirmed, ready) is True
+    assert "accepted" in status
+    assert bias <= 0.0
+
+
+def test_reject_ui_candidate_does_not_enable_run(fixtures_dir: Path) -> None:
+    from watermark_remover.io.image import read_image
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "detect_pos1.png"))
+    candidates, _status = detect_ui_candidates(
+        rgb,
+        fixtures_dir / "template_logo.png",
+        sensitivity=50,
+    )
+    label = format_candidate_label(0, candidates[0].confidence)
+    remaining, bias, status = reject_ui_candidate(label, candidates, 0.0)
+    assert "rejected" in status
+    assert bias > 0.0
+    assert len(remaining) == len(candidates) - 1
+    assert is_run_enabled(candidates[0].mask, False, True) is False
+
+
+def test_template_preview_from_file(fixtures_dir: Path) -> None:
+    preview, status = template_preview_from_file(fixtures_dir / "template_logo.png")
+    assert preview is not None
+    assert preview.ndim == 3
+    assert preview.shape[2] == 3
+    assert "template loaded" in status
+    empty, cleared = template_preview_from_file(None)
+    assert empty is None
+    assert "no template" in cleared
+
+
+def test_detect_without_template_warns_heuristic(fixtures_dir: Path) -> None:
+    from watermark_remover.io.image import read_image
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "still_logo.png"))
+    candidates, status = detect_ui_candidates(rgb, None, sensitivity=50)
+    assert candidates
+    assert "heuristic" in status
+    assert is_run_enabled(candidates[0].mask, False, True) is False
 
 
 def test_on_run_converts_rgb_to_bgr_before_processor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -516,3 +607,9 @@ def test_ui_app_has_no_inpaint_math() -> None:
     assert "cv2.inpaint" not in text
     assert "INPAINT_TELEA" not in text
     assert "INPAINT_NS" not in text
+    assert "Detection Mode" in text
+    assert "Run Detection" in text
+    assert "Template preview" in text
+    assert '"Accept"' in text or "Accept" in text
+    assert '"Reject"' in text or "Reject" in text
+    assert "Sensitivity" in text
