@@ -30,6 +30,29 @@ def _best_iou(candidates: list[MaskCandidate], gt: np.ndarray) -> float:
     return max(_iou(candidate.mask, gt) for candidate in candidates)
 
 
+def _precision_recall(
+    candidates: list[MaskCandidate],
+    gt: np.ndarray,
+    *,
+    iou_min: float = IOU_MIN,
+) -> tuple[float, float, int, int]:
+    """Single-object precision/recall: TP if IoU(candidate, GT) >= iou_min."""
+    true_positives = sum(1 for candidate in candidates if _iou(candidate.mask, gt) >= iou_min)
+    false_positives = len(candidates) - true_positives
+    false_negatives = 0 if true_positives else 1
+    precision = (
+        true_positives / float(true_positives + false_positives)
+        if (true_positives + false_positives)
+        else 0.0
+    )
+    recall = (
+        true_positives / float(true_positives + false_negatives)
+        if (true_positives + false_negatives)
+        else 0.0
+    )
+    return precision, recall, true_positives, false_positives
+
+
 def _assert_candidate_contract(candidate: MaskCandidate, frame: np.ndarray) -> None:
     assert candidate.mask.dtype == np.uint8
     assert set(np.unique(candidate.mask).tolist()).issubset({0, 255})
@@ -105,7 +128,12 @@ def test_template_candidates_iou_vs_gt(fixtures_dir: Path, stem: str) -> None:
     candidates = provider.detect_candidates(frame, 0)
     template_hits = [c for c in candidates if c.method == "template"]
     assert template_hits
+    precision, recall, true_positives, false_positives = _precision_recall(template_hits, gt)
     assert _best_iou(template_hits, gt) >= IOU_MIN
+    assert true_positives >= 1
+    assert recall == 1.0
+    assert precision == 1.0
+    assert false_positives == 0
     with pytest.raises(MaskError, match="confirm"):
         provider.get_mask(frame, 0)
 
@@ -118,7 +146,12 @@ def test_edge_contrast_on_still_logo_iou(fixtures_dir: Path) -> None:
     assert candidates
     assert all(c.method != "frame_diff" for c in candidates)
     assert any(c.method == "edge_contrast" for c in candidates)
+    precision, recall, true_positives, false_positives = _precision_recall(candidates, gt)
     assert _best_iou(candidates, gt) >= IOU_MIN
+    assert true_positives >= 1
+    assert recall == 1.0
+    assert precision >= 0.5
+    assert false_positives <= true_positives
 
 
 def test_single_still_skips_frame_differencing() -> None:
@@ -126,7 +159,9 @@ def test_single_still_skips_frame_differencing() -> None:
     frame[2:10, 4:16] = 255
     provider = AutoDetectMaskProvider(sensitivity=80.0)
     candidates = provider.detect_candidates(frame, 0)
+    assert candidates
     assert all(c.method != "frame_diff" for c in candidates)
+    assert any(c.method == "edge_contrast" for c in candidates)
 
 
 def test_frame_diff_static_logo_iou() -> None:
@@ -151,7 +186,12 @@ def test_frame_diff_static_logo_iou() -> None:
     candidates = provider.detect_candidates(current, 1)
     diff_hits = [c for c in candidates if c.method == "frame_diff"]
     assert diff_hits
+    precision, recall, true_positives, false_positives = _precision_recall(diff_hits, gt)
     assert _best_iou(diff_hits, gt) >= IOU_MIN
+    assert true_positives >= 1
+    assert recall == 1.0
+    assert precision == 1.0
+    assert false_positives == 0
     with pytest.raises(MaskError, match="confirm"):
         provider.get_mask(current, 1)
 

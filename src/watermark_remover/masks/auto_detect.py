@@ -495,12 +495,16 @@ def _nms_candidates(
     peaks: list[tuple[float, np.ndarray, tuple[int, int, int, int]]],
     *,
     method: str,
-    iou_thresh: float = 0.3,
+    iou_thresh: float = 0.25,
 ) -> list[MaskCandidate]:
     peaks = sorted(peaks, key=lambda item: item[0], reverse=True)
     kept: list[tuple[float, np.ndarray, tuple[int, int, int, int]]] = []
     for item in peaks:
-        if any(_bbox_iou(item[2], other[2]) >= iou_thresh for other in kept):
+        if any(
+            _bbox_iou(item[2], other[2]) >= iou_thresh
+            or _mask_overlap(item[1], other[1]) >= iou_thresh
+            for other in kept
+        ):
             continue
         kept.append(item)
         if len(kept) >= _MAX_CANDIDATES_PER_METHOD:
@@ -541,6 +545,16 @@ def _bbox_iou(
     if union <= 0:
         return 0.0
     return inter / float(union)
+
+
+def _mask_overlap(left: np.ndarray, right: np.ndarray) -> float:
+    a = left > 0
+    b = right > 0
+    intersection = int(np.count_nonzero(a & b))
+    union = int(np.count_nonzero(a | b))
+    if union == 0:
+        return 0.0
+    return intersection / float(union)
 
 
 def _checkerboard(height: int, width: int, cell: int = 8) -> np.ndarray:
