@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -45,6 +47,10 @@ _OVERLAY_COLOR = np.array([15, 98, 254], dtype=np.float32)
 _OVERLAY_ALPHA = 0.45
 _MASK_LAYER_RGBA = (15, 98, 254, 180)
 _STREAM_FIELDS = ("job_id", "engine", "frame_idx", "duration_ms", "error")
+_TEMP_PREFIXES = ("watermark-remover-out-", "watermark-remover-mask-")
+_STEM_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+_ACTIVE_CANCEL_TOKENS: dict[str, dict[str, bool]] = {}
+_CANCEL_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -186,11 +192,30 @@ def import_mask_from_path(path: Path, frame_hw: tuple[int, int]) -> np.ndarray:
     raise MaskError(f"mask must be .png or .json, got '{src.suffix}'")
 
 
+def resolve_imported_mask(
+    file_value: object,
+    image_rgb: np.ndarray | None,
+    current_mask: np.ndarray | None,
+) -> tuple[np.ndarray | None, bool, str]:
+    if image_rgb is None:
+        return current_mask, False, "Status: waiting for input"
+    try:
+        path = _as_path(file_value)
+        if path is None:
+            raise MaskError("no mask file")
+        frame_hw = (int(image_rgb.shape[0]), int(image_rgb.shape[1]))
+        loaded = import_mask_from_path(path, frame_hw)
+    except (MaskError, OSError, InputValidationError) as exc:
+        return current_mask, False, f"Status: {exc}"
+    return loaded, True, "Status: mask imported — confirm the overlay before run"
+
+
 def export_session_masks(mask: np.ndarray, stem: str, dest_dir: Path) -> tuple[Path, Path]:
     binary = ui_mask_to_uint8(mask)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    png_path = dest_dir / f"{stem}.mask.png"
-    json_path = dest_dir / f"{stem}.mask.json"
+    safe_stem = safe_output_stem(stem)
+    png_path = _path_in_dir(dest_dir, f"{safe_stem}.mask.png")
+    json_path = _path_in_dir(dest_dir, f"{safe_stem}.mask.json")
     export_mask_png(png_path, binary)
     export_mask_json(json_path, mask_to_polygon_payload(binary))
     return png_path, json_path
@@ -228,8 +253,42 @@ def cleanup_temp_dir(path: str | None) -> None:
     if not path:
         return
     dest = Path(path)
-    if dest.is_dir():
-        shutil.rmtree(dest, ignore_errors=True)
+    try:
+        resolved = dest.resolve()
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        resolved.relative_to(tmp_root)
+    except (OSError, ValueError):
+        return
+    if not resolved.is_dir():
+        return
+    if not any(resolved.name.startswith(prefix) for prefix in _TEMP_PREFIXES):
+        return
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
+def safe_output_stem(stem: str | None) -> str:
+    name = Path(str(stem or "image")).name
+    cleaned = _STEM_SAFE.sub("_", name).strip("._")
+    if not cleaned or cleaned in {".", ".."}:
+        return "image"
+    return cleaned[:80]
+
+
+def _path_in_dir(dest_dir: Path, filename: str) -> Path:
+    dest_dir = dest_dir.resolve()
+    candidate = (dest_dir / Path(filename).name).resolve()
+    if candidate.parent != dest_dir:
+        raise InputValidationError("refusing path outside job temp dir")
+    return candidate
+
+
+def request_job_cancel(job_id: str | None) -> None:
+    with _CANCEL_LOCK:
+        if job_id and job_id in _ACTIVE_CANCEL_TOKENS:
+            _ACTIVE_CANCEL_TOKENS[job_id]["requested"] = True
+            return
+        for token in _ACTIVE_CANCEL_TOKENS.values():
+            token["requested"] = True
 
 
 def format_structlog_event(event_dict: dict[str, Any]) -> str:
@@ -325,66 +384,74 @@ def run_image_job(
 
     with capturing_structlog() as lines:
         job_log = structlog.get_logger("watermark_remover.ui")
-        job_log.info("job_start", job_id=job_id, engine=engine_name)
-        if _cancel_requested(cancel_token):
-            job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
-            return _done(lines, status="Status: cancelled", cancelled=True)
-        if not is_run_enabled(mask, mask_confirmed, preview_ready):
-            job_log.info(
-                "run_blocked",
-                job_id=job_id,
-                engine=engine_name,
-                error="mask not confirmed",
-            )
-            return _done(lines, status="Status: confirm the preview overlay before run")
+        token = cancel_token if isinstance(cancel_token, dict) else {"requested": False}
+        with _CANCEL_LOCK:
+            _ACTIVE_CANCEL_TOKENS[job_id] = token
         try:
-            started = time.perf_counter()
-            rgb = on_run(image, mask, engine_name, config)
-            duration_ms = round((time.perf_counter() - started) * 1000.0, 2)
-            job_log.info(
-                "inpaint_done",
-                job_id=job_id,
-                engine=engine_name,
-                frame_idx=0,
-                duration_ms=duration_ms,
+            job_log.info("job_start", job_id=job_id, engine=engine_name)
+            if _cancel_requested(token):
+                job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
+                return _done(lines, status="Status: cancelled", cancelled=True)
+            if not is_run_enabled(mask, mask_confirmed, preview_ready):
+                job_log.info(
+                    "run_blocked",
+                    job_id=job_id,
+                    engine=engine_name,
+                    error="mask not confirmed",
+                )
+                return _done(lines, status="Status: confirm the preview overlay before run")
+            try:
+                started = time.perf_counter()
+                rgb = on_run(image, mask, engine_name, config)
+                duration_ms = round((time.perf_counter() - started) * 1000.0, 2)
+                job_log.info(
+                    "inpaint_done",
+                    job_id=job_id,
+                    engine=engine_name,
+                    frame_idx=0,
+                    duration_ms=duration_ms,
+                )
+            except (InputValidationError, MaskError, EngineError, ResourceLimitError) as exc:
+                job_log.error(
+                    "ui_run_failed",
+                    job_id=job_id,
+                    engine=engine_name,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                return _done(lines, status=f"Status: {exc}")
+            if _cancel_requested(token):
+                job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
+                return _done(lines, status="Status: cancelled", cancelled=True)
+            dest_dir = Path(tempfile.mkdtemp(prefix="watermark-remover-out-"))
+            safe_stem = safe_output_stem(stem)
+            out_name = f"{safe_stem}_inpainted.png"
+            out_path = _path_in_dir(dest_dir, out_name)
+            try:
+                if input_path is not None:
+                    refuse_overwrite_unless_flag(Path(input_path), out_path, overwrite=False)
+                write_image_atomic(out_path, rgb_to_bgr(rgb))
+            except InputValidationError as exc:
+                cleanup_temp_dir(str(dest_dir))
+                job_log.error(
+                    "ui_run_failed",
+                    job_id=job_id,
+                    engine=engine_name,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                return _done(lines, status=f"Status: {exc}")
+            return _done(
+                lines,
+                image_rgb=rgb,
+                output_path=str(out_path),
+                temp_dir=str(dest_dir),
+                percent=100,
+                status=f"Status: done ({out_name})",
             )
-        except (InputValidationError, MaskError, EngineError, ResourceLimitError) as exc:
-            job_log.error(
-                "ui_run_failed",
-                job_id=job_id,
-                engine=engine_name,
-                error=str(exc),
-                exc_info=True,
-            )
-            return _done(lines, status=f"Status: {exc}")
-        if _cancel_requested(cancel_token):
-            job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
-            return _done(lines, status="Status: cancelled", cancelled=True)
-        dest_dir = Path(tempfile.mkdtemp(prefix="watermark-remover-out-"))
-        out_name = f"{stem}_inpainted.png"
-        out_path = dest_dir / out_name
-        try:
-            if input_path is not None:
-                refuse_overwrite_unless_flag(Path(input_path), out_path, overwrite=False)
-            write_image_atomic(out_path, rgb_to_bgr(rgb))
-        except InputValidationError as exc:
-            cleanup_temp_dir(str(dest_dir))
-            job_log.error(
-                "ui_run_failed",
-                job_id=job_id,
-                engine=engine_name,
-                error=str(exc),
-                exc_info=True,
-            )
-            return _done(lines, status=f"Status: {exc}")
-        return _done(
-            lines,
-            image_rgb=rgb,
-            output_path=str(out_path),
-            temp_dir=str(dest_dir),
-            percent=100,
-            status=f"Status: done ({out_name})",
-        )
+        finally:
+            with _CANCEL_LOCK:
+                _ACTIVE_CANCEL_TOKENS.pop(job_id, None)
 
 
 def format_byte_limit(max_input_bytes: int) -> str:
@@ -588,28 +655,35 @@ def build_app(settings: Settings | None = None) -> Any:
     def on_import_mask(
         file_value: object,
         image_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        preview: np.ndarray | None,
+        confirmed: bool,
+        preview_ready_flag: bool,
     ) -> tuple[Any, ...]:
-        disabled = _run_update(False)
-        if image_rgb is None:
-            return None, gr.update(), None, False, False, disabled, "Status: waiting for input"
-        try:
-            path = _as_path(file_value)
-            if path is None:
-                raise MaskError("no mask file")
-            frame_hw = (int(image_rgb.shape[0]), int(image_rgb.shape[1]))
-            mask = import_mask_from_path(path, frame_hw)
-            preview = overlay_mask_rgb(image_rgb, mask)
-            editor = _editor_value(_as_rgb(image_rgb), mask)
-        except (MaskError, OSError) as exc:
-            return None, gr.update(), None, False, False, disabled, f"Status: {exc}"
+        mask, replaced, status_text = resolve_imported_mask(
+            file_value, image_rgb, current_mask
+        )
+        if not replaced:
+            return (
+                current_mask,
+                gr.update(),
+                preview,
+                confirmed,
+                preview_ready_flag,
+                _run_update(is_run_enabled(current_mask, confirmed, preview_ready_flag)),
+                status_text,
+            )
+        assert image_rgb is not None
+        overlay = overlay_mask_rgb(image_rgb, mask)
+        editor = _editor_value(_as_rgb(image_rgb), mask)
         return (
             mask,
             editor,
-            preview,
+            overlay,
             False,
             True,
-            disabled,
-            "Status: mask imported — confirm the overlay before run",
+            _run_update(False),
+            status_text,
         )
 
     def on_export_mask(
@@ -637,11 +711,9 @@ def build_app(settings: Settings | None = None) -> Any:
 
     def on_cancel(
         job_temp: str | None,
-        cancel_token: dict[str, Any] | None,
         job_id: str | None,
     ) -> tuple[dict[str, bool], str, int, str]:
-        token = dict(cancel_token) if isinstance(cancel_token, dict) else {}
-        token["requested"] = True
+        request_job_cancel(job_id)
         cleanup_temp_dir(job_temp)
         with capturing_structlog() as lines:
             job_log = structlog.get_logger("watermark_remover.ui")
@@ -649,7 +721,7 @@ def build_app(settings: Settings | None = None) -> Any:
             if job_id:
                 kwargs["job_id"] = job_id
             job_log.info("job_cancelled", **kwargs)
-        return token, "\n".join(lines), 0, "Status: cancelled"
+        return {"requested": False}, "\n".join(lines), 0, "Status: cancelled"
 
     def on_process(
         image_rgb: np.ndarray | None,
@@ -662,10 +734,8 @@ def build_app(settings: Settings | None = None) -> Any:
         stem: str | None,
         input_path: str | None,
         job_temp: str | None,
-        cancel_token: dict[str, Any] | bool | None,
     ) -> tuple[Any, ...]:
         cleanup_temp_dir(job_temp)
-        token = cancel_token if isinstance(cancel_token, dict) else {"requested": False}
         cfg = settings.model_copy(
             update={
                 "opencv_radius": max(int(radius), 1),
@@ -681,7 +751,7 @@ def build_app(settings: Settings | None = None) -> Any:
             input_path=input_path,
             mask_confirmed=mask_confirmed,
             preview_ready=preview_ready,
-            cancel_token=token,
+            cancel_token={"requested": False},
         )
         return (
             job.image_rgb,
@@ -863,7 +933,14 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         mask_import.upload(
             on_import_mask,
-            inputs=[mask_import, image_state],
+            inputs=[
+                mask_import,
+                image_state,
+                mask_state,
+                preview_image,
+                mask_confirmed,
+                preview_ready,
+            ],
             outputs=[
                 mask_state,
                 mask_editor,
@@ -897,7 +974,6 @@ def build_app(settings: Settings | None = None) -> Any:
                 input_stem,
                 input_path_state,
                 job_temp_state,
-                cancel_state,
             ],
             outputs=[
                 result_image,
@@ -912,7 +988,7 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         cancel_btn.click(
             on_cancel,
-            inputs=[job_temp_state, cancel_state, job_id_box],
+            inputs=[job_temp_state, job_id_box],
             outputs=[cancel_state, log_box, percent, status],
             cancels=[run_event],
         )

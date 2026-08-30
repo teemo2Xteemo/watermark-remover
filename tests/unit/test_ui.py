@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -266,6 +267,111 @@ def test_run_image_job_cancel_skips_write_after_inpaint(
     assert job.output_path is None
     assert "inpaint_done" in job.log_text
     assert "job_cancelled" in job.log_text
+
+
+def test_request_job_cancel_mutates_active_token(
+    fixtures_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from watermark_remover.io.image import read_image
+    from watermark_remover.masks.serialize import load_mask_png
+    from watermark_remover.ui.app import request_job_cancel
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "still_logo.png"))
+    mask = load_mask_png(fixtures_dir / "still_logo.mask.png")
+    original = ImageProcessor.process
+
+    def cancel_active(
+        self: ImageProcessor,
+        image: np.ndarray,
+        mask_arg: np.ndarray,
+        engine_name: str,
+        config: Settings,
+        **kwargs: object,
+    ) -> np.ndarray:
+        request_job_cancel(None)
+        return original(self, image, mask_arg, engine_name, config, **kwargs)
+
+    monkeypatch.setattr(ImageProcessor, "process", cancel_active)
+    job = run_image_job(rgb, mask, "opencv", Settings(), cancel_token={"requested": False})
+    assert job.cancel_requested is True
+    assert job.output_path is None
+
+
+def test_safe_output_stem_strips_traversal() -> None:
+    from watermark_remover.ui.app import safe_output_stem
+
+    assert safe_output_stem("still_logo") == "still_logo"
+    assert "/" not in safe_output_stem("../etc/passwd")
+    assert "\\" not in safe_output_stem("..\\..\\secret")
+    assert Path(safe_output_stem("../etc/passwd")).name == safe_output_stem("../etc/passwd")
+    assert safe_output_stem("..") == "image"
+    assert safe_output_stem(None) == "image"
+
+
+def test_run_image_job_stem_stays_inside_temp(fixtures_dir: Path) -> None:
+    from watermark_remover.io.image import read_image
+    from watermark_remover.masks.serialize import load_mask_png
+
+    rgb = bgr_to_rgb(read_image(fixtures_dir / "still_logo.png"))
+    mask = load_mask_png(fixtures_dir / "still_logo.mask.png")
+    job = run_image_job(
+        rgb,
+        mask,
+        "opencv",
+        Settings(),
+        stem="../../outside",
+    )
+    assert job.output_path is not None
+    out = Path(job.output_path)
+    assert out.parent.name.startswith("watermark-remover-out-")
+    assert out.name == "outside_inpainted.png"
+
+
+def test_cleanup_temp_dir_ignores_paths_outside_temp(tmp_path: Path) -> None:
+    from watermark_remover.ui.app import cleanup_temp_dir
+
+    target = tmp_path / "keep_me"
+    target.mkdir()
+    marker = target / "file.txt"
+    marker.write_text("ok", encoding="utf-8")
+    cleanup_temp_dir(str(target))
+    assert marker.is_file()
+
+
+def test_cleanup_temp_dir_removes_own_prefix() -> None:
+    from watermark_remover.ui.app import cleanup_temp_dir
+
+    dest = Path(tempfile.mkdtemp(prefix="watermark-remover-out-"))
+    marker = dest / "x.txt"
+    marker.write_text("tmp", encoding="utf-8")
+    cleanup_temp_dir(str(dest))
+    assert not dest.exists()
+
+
+def test_failed_mask_import_keeps_current(fixtures_dir: Path, tmp_path: Path) -> None:
+    from watermark_remover.masks.serialize import load_mask_png
+    from watermark_remover.ui.app import resolve_imported_mask
+
+    current = load_mask_png(fixtures_dir / "still_logo.mask.png")
+    rgb = np.zeros((current.shape[0], current.shape[1], 3), dtype=np.uint8)
+    bad = tmp_path / "not_a_mask.txt"
+    bad.write_text("nope", encoding="utf-8")
+    kept, replaced, status = resolve_imported_mask(bad, rgb, current)
+    assert replaced is False
+    assert kept is current
+    assert "Status:" in status
+
+
+def test_export_session_masks_stem_stays_in_dest(tmp_path: Path) -> None:
+    from watermark_remover.ui.app import export_session_masks
+
+    mask = np.zeros((8, 10), dtype=np.uint8)
+    mask[1:4, 2:6] = 255
+    png_path, json_path = export_session_masks(mask, "../../etc/passwd", tmp_path)
+    assert png_path.parent == tmp_path.resolve()
+    assert json_path.parent == tmp_path.resolve()
+    assert png_path.name == "passwd.mask.png"
+    assert json_path.name == "passwd.mask.json"
 
 
 def test_lama_cpu_warning_when_cuda_mocked_off(monkeypatch: pytest.MonkeyPatch) -> None:
