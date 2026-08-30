@@ -115,6 +115,60 @@ def overlay_mask_rgb(image: np.ndarray, mask: np.ndarray | dict[str, Any] | None
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
+def _nonempty_mask(mask: np.ndarray | dict[str, Any] | None) -> np.ndarray | None:
+    try:
+        binary = ui_mask_to_uint8(mask)
+    except MaskError:
+        return None
+    if int(np.count_nonzero(binary)) == 0:
+        return None
+    return binary
+
+
+def preview_mask_from_editor(
+    editor: np.ndarray | dict[str, Any] | None,
+    image_rgb: np.ndarray | None,
+    current_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, bool, str]:
+    """Sample the editor once. Do not call this on live ImageEditor.change."""
+    if image_rgb is None:
+        return None, None, False, "Status: waiting for input"
+    mask = _nonempty_mask(editor)
+    if mask is None:
+        mask = _nonempty_mask(current_mask)
+    if mask is None:
+        return None, None, False, "Status: draw a mask on the editor"
+    overlay = overlay_mask_rgb(image_rgb, mask)
+    return mask, overlay, True, "Status: preview ready — confirm the overlay before run"
+
+
+def confirm_mask_from_sources(
+    editor: np.ndarray | dict[str, Any] | None,
+    image_rgb: np.ndarray | None,
+    current_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, bool, bool, bool, str]:
+    mask, overlay, ready, _status = preview_mask_from_editor(
+        editor, image_rgb, current_mask
+    )
+    if not is_run_enabled(mask, True, ready):
+        return (
+            mask,
+            overlay,
+            False,
+            ready,
+            False,
+            "Status: confirm requires a non-empty mask overlay",
+        )
+    return (
+        mask,
+        overlay,
+        True,
+        True,
+        True,
+        "Status: mask confirmed — Process All is enabled",
+    )
+
+
 def on_run(
     image: np.ndarray | None,
     mask: np.ndarray | None,
@@ -606,26 +660,27 @@ def build_app(settings: Settings | None = None) -> Any:
             rgb,
         )
 
-    def on_editor_change(
+    def on_update_preview(
         editor: dict[str, Any] | None,
         image_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        preview: np.ndarray | None,
+        confirmed: bool,
+        preview_ready_flag: bool,
     ) -> tuple[Any, ...]:
-        disabled = _run_update(False)
-        if image_rgb is None:
-            return None, False, False, None, disabled, "Status: waiting for input"
-        try:
-            mask = ui_mask_to_uint8(editor)
-        except MaskError:
-            return None, False, False, None, disabled, "Status: draw a mask on the editor"
-        preview = overlay_mask_rgb(image_rgb, mask)
-        return (
-            mask,
-            False,
-            True,
-            preview,
-            disabled,
-            "Status: preview ready — confirm the overlay before run",
+        mask, overlay, ready, status_text = preview_mask_from_editor(
+            editor, image_rgb, current_mask
         )
+        if not ready:
+            return (
+                current_mask,
+                preview if overlay is None else overlay,
+                confirmed,
+                preview_ready_flag,
+                _run_update(is_run_enabled(current_mask, confirmed, preview_ready_flag)),
+                status_text,
+            )
+        return mask, overlay, False, True, _run_update(False), status_text
 
     def on_add_bbox(
         image_rgb: np.ndarray | None,
@@ -701,13 +756,24 @@ def build_app(settings: Settings | None = None) -> Any:
         )
 
     def on_confirm_mask(
-        mask: np.ndarray | None,
-        preview_ready: bool,
-    ) -> tuple[bool, Any, str]:
-        enabled = is_run_enabled(mask, True, preview_ready)
+        editor: dict[str, Any] | None,
+        image_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        preview: np.ndarray | None,
+    ) -> tuple[Any, ...]:
+        mask, overlay, confirmed, ready, enabled, status_text = confirm_mask_from_sources(
+            editor, image_rgb, current_mask
+        )
         if not enabled:
-            return False, _run_update(False), "Status: confirm requires a non-empty mask overlay"
-        return True, _run_update(True), "Status: mask confirmed — Process All is enabled"
+            return (
+                current_mask if mask is None else mask,
+                preview if overlay is None else overlay,
+                False,
+                ready,
+                _run_update(False),
+                status_text,
+            )
+        return mask, overlay, True, True, _run_update(True), status_text
 
     def on_cancel(
         job_temp: str | None,
@@ -802,7 +868,7 @@ def build_app(settings: Settings | None = None) -> Any:
         with gr.Group():
             gr.Markdown("## Mask")
             gr.Markdown(
-                "Draw freehand or add a bounding box. "
+                "Draw freehand or add a bounding box, then Update preview. "
                 "Import/export uses `{stem}.mask.png` and `{stem}.mask.json`."
             )
             mask_editor = gr.ImageEditor(
@@ -811,7 +877,7 @@ def build_app(settings: Settings | None = None) -> Any:
                 image_mode="RGB",
                 sources=(),
                 transforms=(),
-                layers=True,
+                layers=False,
                 brush=gr.Brush(
                     default_size=20,
                     colors=["#ef4444"],
@@ -846,7 +912,9 @@ def build_app(settings: Settings | None = None) -> Any:
                 interactive=False,
                 buttons=["fullscreen"],
             )
-            confirm_btn = gr.Button("Confirm mask")
+            with gr.Row():
+                update_preview_btn = gr.Button("Update preview")
+                confirm_btn = gr.Button("Confirm mask")
 
         with gr.Group():
             gr.Markdown("## Engine")
@@ -906,17 +974,31 @@ def build_app(settings: Settings | None = None) -> Any:
                 input_preview,
             ],
         )
-        mask_editor.change(
-            on_editor_change,
-            inputs=[mask_editor, image_state],
-            outputs=[
-                mask_state,
-                mask_confirmed,
-                preview_ready,
-                preview_image,
-                run_btn,
-                status,
-            ],
+        preview_inputs = [
+            mask_editor,
+            image_state,
+            mask_state,
+            preview_image,
+            mask_confirmed,
+            preview_ready,
+        ]
+        preview_outputs = [
+            mask_state,
+            preview_image,
+            mask_confirmed,
+            preview_ready,
+            run_btn,
+            status,
+        ]
+        update_preview_btn.click(
+            on_update_preview,
+            inputs=preview_inputs,
+            outputs=preview_outputs,
+        )
+        mask_editor.apply(
+            on_update_preview,
+            inputs=preview_inputs,
+            outputs=preview_outputs,
         )
         add_bbox_btn.click(
             on_add_bbox,
@@ -958,8 +1040,15 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         confirm_btn.click(
             on_confirm_mask,
-            inputs=[mask_state, preview_ready],
-            outputs=[mask_confirmed, run_btn, status],
+            inputs=[mask_editor, image_state, mask_state, preview_image],
+            outputs=[
+                mask_state,
+                preview_image,
+                mask_confirmed,
+                preview_ready,
+                run_btn,
+                status,
+            ],
         )
         run_event = run_btn.click(
             on_process,
