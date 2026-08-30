@@ -95,8 +95,10 @@ def _run(
     log = structlog.get_logger("watermark_remover")
     log.info("job_start", engine=engine, input_path=input_path.name)
 
-    if str(mask_path) == "auto":
-        raise InputValidationError("auto-detect masks are not available yet (M3)")
+    if str(mask_path) == "auto" or Path(mask_path).name == "auto":
+        raise MaskError(
+            "auto-detect never auto-applies; pass a mask file or accept a candidate in the UI"
+        )
 
     validated_input = validate_input_path(input_path)
     validate_size_limits(validated_input, settings.max_input_bytes)
