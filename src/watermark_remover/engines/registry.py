@@ -12,6 +12,11 @@ from watermark_remover.engines.opencv_engine import OpenCVInpaintEngine
 from watermark_remover.exceptions import EngineError
 
 EngineName = Literal["opencv", "lama", "auto"]
+ResolvedEngineName = Literal["opencv", "lama"]
+
+# Placeholder files (e.g. 19-byte stubs) are not valid ONNX; test fixture tiny.onnx is larger.
+_MIN_WEIGHTS_BYTES = 128
+_SETUP_COMMAND = "python scripts/download_models.py"
 
 
 def get_engine(
@@ -37,13 +42,48 @@ def _opencv_engine(settings: Settings) -> OpenCVInpaintEngine:
     )
 
 
-def _lama_engine(settings: Settings) -> LaMaInpaintEngine:
-    weights = (
+def resolved_engine_name(engine: InpaintEngine) -> ResolvedEngineName:
+    if isinstance(engine, LaMaInpaintEngine):
+        return "lama"
+    return "opencv"
+
+
+def resolve_lama_weights(settings: Settings) -> Path:
+    """Return a usable ONNX path. Skip tiny placeholders and try MODEL_DIR/lama.onnx."""
+    primary = (
         Path(settings.lama_weights)
         if settings.lama_weights is not None
         else Path(settings.model_dir) / "lama.onnx"
     )
-    return LaMaInpaintEngine(weights_path=weights, device=_lama_device())
+    fallback = Path(settings.model_dir) / "lama.onnx"
+    if _is_usable_weights(primary):
+        return primary
+    primary_exists = False
+    try:
+        primary_exists = primary.is_file()
+    except OSError:
+        primary_exists = False
+    if primary_exists and not _same_path(primary, fallback) and _is_usable_weights(fallback):
+        return fallback
+    raise EngineError(f"LaMa weights not found ({primary.name}). Run: {_SETUP_COMMAND}")
+
+
+def _is_usable_weights(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= _MIN_WEIGHTS_BYTES
+    except OSError:
+        return False
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return str(left).replace("\\", "/").lower() == str(right).replace("\\", "/").lower()
+
+
+def _lama_engine(settings: Settings) -> LaMaInpaintEngine:
+    return LaMaInpaintEngine(weights_path=resolve_lama_weights(settings), device=_lama_device())
 
 
 def _lama_device() -> str:

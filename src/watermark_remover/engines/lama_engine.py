@@ -14,6 +14,7 @@ _SEED = 0
 _MODULO = 8
 _TILE_SIZE = 512
 _TILE_OVERLAP = 32
+_INFER_DILATE = 3
 _SETUP_COMMAND = "python scripts/download_models.py"
 
 
@@ -93,17 +94,28 @@ class LaMaInpaintEngine(InpaintEngine):
             raise MaskError(f"mask shape {binary.shape} does not match image {image.shape[:2]}")
         _pin_seeds(self._device)
         height, width = image.shape[:2]
-        if height > _TILE_SIZE or width > _TILE_SIZE:
-            return TiledInpaint(_TILE_SIZE, _TILE_OVERLAP).process(image, binary, _PaddedPass(self))
-        return self._infer_padded(image, binary)
+        window_h, window_w = self._window_size(height, width)
+        crop = _window_around_mask(binary, window_h, window_w, height, width)
+        if crop is not None:
+            y0, y1, x0, x1 = crop
+            filled = self._infer_padded(image[y0:y1, x0:x1], binary[y0:y1, x0:x1])
+            result = image.copy()
+            local = binary[y0:y1, x0:x1] > 0
+            result[y0:y1, x0:x1][local] = filled[local]
+            return np.ascontiguousarray(result)
+        return TiledInpaint(_TILE_SIZE, _TILE_OVERLAP).process(image, binary, _PaddedPass(self))
+
+    def _window_size(self, height: int, width: int) -> tuple[int, int]:
+        if self._fixed_hw is not None:
+            return self._fixed_hw
+        return min(_TILE_SIZE, height), min(_TILE_SIZE, width)
 
     def _infer_padded(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         orig_h, orig_w = image.shape[:2]
         target_h, target_w = self._pad_target(orig_h, orig_w)
-        pad_h = target_h - orig_h
-        pad_w = target_w - orig_w
-        padded_image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
-        padded_mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
+        infer_mask = _dilate_mask(mask)
+        padded_image, top, left = _pad_hwc(image, target_h, target_w, is_mask=False)
+        padded_mask, _, _ = _pad_hwc(infer_mask, target_h, target_w, is_mask=True)
         rgb = cv2.cvtColor(padded_image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         image_nchw = np.transpose(rgb, (2, 0, 1))[None, ...]
         mask_nchw = (padded_mask > 0).astype(np.float32)[None, None, ...]
@@ -117,9 +129,11 @@ class LaMaInpaintEngine(InpaintEngine):
             )
         except Exception as exc:
             raise EngineError("LaMa ONNX inference failed") from exc
-        bgr = _output_to_bgr(outputs[0])[:orig_h, :orig_w]
-        bgr[mask == 0] = image[mask == 0]
-        return np.ascontiguousarray(bgr)
+        bgr = _output_to_bgr(outputs[0])[top : top + orig_h, left : left + orig_w]
+        result = image.copy()
+        hole = mask > 0
+        result[hole] = bgr[hole]
+        return np.ascontiguousarray(result)
 
     def _pad_target(self, height: int, width: int) -> tuple[int, int]:
         if self._fixed_hw is not None:
@@ -179,3 +193,57 @@ def _output_to_bgr(raw: np.ndarray) -> np.ndarray:
     rgb = np.clip(chw * scale, 0, 255).astype(np.uint8)
     hwc = np.transpose(rgb, (1, 2, 0))
     return cv2.cvtColor(hwc, cv2.COLOR_RGB2BGR)
+
+
+def _dilate_mask(mask: np.ndarray) -> np.ndarray:
+    if _INFER_DILATE < 1:
+        return mask
+    kernel = np.ones((_INFER_DILATE, _INFER_DILATE), np.uint8)
+    return cv2.dilate(mask, kernel)
+
+
+def _pad_hwc(
+    array: np.ndarray, target_h: int, target_w: int, *, is_mask: bool
+) -> tuple[np.ndarray, int, int]:
+    height, width = array.shape[:2]
+    pad_h = max(0, target_h - height)
+    pad_w = max(0, target_w - width)
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    if is_mask:
+        padded = np.pad(
+            array,
+            ((top, bottom), (left, right)),
+            mode="constant",
+            constant_values=0,
+        )
+        return padded, top, left
+    can_reflect = top < height and bottom < height and left < width and right < width
+    mode = "symmetric" if can_reflect else "edge"
+    padded = np.pad(array, ((top, bottom), (left, right), (0, 0)), mode=mode)
+    return padded, top, left
+
+
+def _window_around_mask(
+    mask: np.ndarray,
+    window_h: int,
+    window_w: int,
+    height: int,
+    width: int,
+) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return 0, min(window_h, height), 0, min(window_w, width)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop_h = min(window_h, height)
+    crop_w = min(window_w, width)
+    if (y1 - y0) > crop_h or (x1 - x0) > crop_w:
+        return None
+    cy = (y0 + y1) // 2
+    cx = (x0 + x1) // 2
+    gy0 = max(0, min(cy - crop_h // 2, height - crop_h))
+    gx0 = max(0, min(cx - crop_w // 2, width - crop_w))
+    return gy0, gy0 + crop_h, gx0, gx0 + crop_w

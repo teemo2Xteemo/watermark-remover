@@ -10,7 +10,7 @@ import pytest
 from watermark_remover.config import Settings
 from watermark_remover.engines.lama_engine import LaMaInpaintEngine
 from watermark_remover.engines.opencv_engine import OpenCVInpaintEngine
-from watermark_remover.engines.registry import get_engine
+from watermark_remover.engines.registry import get_engine, resolve_lama_weights
 from watermark_remover.exceptions import EngineError
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.io.image import read_image, write_image_atomic
@@ -147,6 +147,29 @@ def test_user_engine_lama_overrides_small_mask(fixtures_dir: Path) -> None:
     assert isinstance(engine, LaMaInpaintEngine)
 
 
+def test_resolve_lama_weights_skips_placeholder_and_uses_model_dir(tmp_path: Path) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    placeholder = tmp_path / "big-lama.onnx"
+    placeholder.write_bytes(b"too-small-to-be-onnx")
+    real = model_dir / "lama.onnx"
+    real.write_bytes(b"x" * 200)
+    settings = Settings(model_dir=model_dir, lama_weights=placeholder)
+    assert resolve_lama_weights(settings) == real
+
+
+def test_resolve_lama_weights_missing_primary_does_not_fallback_to_cwd_models(
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "lama.onnx").write_bytes(b"x" * 200)
+    missing = tmp_path / "missing.onnx"
+    settings = Settings(model_dir=model_dir, lama_weights=missing)
+    with pytest.raises(EngineError, match="download_models"):
+        resolve_lama_weights(settings)
+
+
 def test_tiny_resolution_does_not_crash(fixtures_dir: Path) -> None:
     image = np.array([[[10, 20, 30], [40, 50, 60]]], dtype=np.uint8)
     mask = np.array([[255, 0]], dtype=np.uint8)
@@ -165,7 +188,16 @@ def test_huge_resolution_tiles_without_crash(fixtures_dir: Path) -> None:
     assert np.array_equal(out[mask == 0], image[mask == 0])
 
 
-def test_image_processor_tiles_huge_opencv() -> None:
+def test_lama_small_mask_on_large_image_only_changes_hole(fixtures_dir: Path) -> None:
+    image = np.random.default_rng(0).integers(0, 256, size=(400, 420, 3), dtype=np.uint8)
+    mask = np.zeros((400, 420), dtype=np.uint8)
+    mask[300:330, 310:350] = 255
+    out = LaMaInpaintEngine(_stub_weights(fixtures_dir), "cpu").process(image, mask)
+    assert out.shape == image.shape
+    assert np.array_equal(out[mask == 0], image[mask == 0])
+
+
+def test_image_processor_huge_opencv_does_not_crash() -> None:
     image = np.full((600, 580, 3), 15, dtype=np.uint8)
     mask = np.zeros((600, 580), dtype=np.uint8)
     mask[20:60, 20:60] = 255

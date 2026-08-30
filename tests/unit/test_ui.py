@@ -270,9 +270,7 @@ def test_preview_mask_from_editor_falls_back_to_current_mask() -> None:
     current = np.zeros((6, 8), dtype=np.uint8)
     current[2:4, 1:3] = 255
     empty_editor = {"background": image, "layers": [], "composite": image}
-    mask, overlay, ready, _status = preview_mask_from_editor(
-        empty_editor, image, current
-    )
+    mask, overlay, ready, _status = preview_mask_from_editor(empty_editor, image, current)
     assert ready is True
     assert mask is not None
     assert int(np.count_nonzero(mask)) == int(np.count_nonzero(current))
@@ -305,13 +303,7 @@ def test_confirm_mask_from_sources_enables_only_with_nonempty_mask() -> None:
 
 
 def test_ui_does_not_subscribe_live_editor_change() -> None:
-    src = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "watermark_remover"
-        / "ui"
-        / "app.py"
-    )
+    src = Path(__file__).resolve().parents[2] / "src" / "watermark_remover" / "ui" / "app.py"
     text = src.read_text(encoding="utf-8")
     assert "mask_editor.change(" not in text
     assert "mask_editor.apply(" in text
@@ -357,6 +349,8 @@ def test_run_image_job_log_is_structlog_stream(fixtures_dir: Path) -> None:
     assert "inpaint_done" in job.log_text
     assert f"job_id={job.job_id}" in job.log_text
     assert "engine=opencv" in job.log_text
+    assert "resolved_engine=opencv" in job.log_text
+    assert "engine: opencv" in job.status
     assert "frame_idx=0" in job.log_text
     assert "duration_ms=" in job.log_text
     assert uuid.UUID(job.job_id).version == 4
@@ -596,13 +590,7 @@ def test_build_app_smoke() -> None:
 
 
 def test_ui_app_has_no_inpaint_math() -> None:
-    src = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "watermark_remover"
-        / "ui"
-        / "app.py"
-    )
+    src = Path(__file__).resolve().parents[2] / "src" / "watermark_remover" / "ui" / "app.py"
     text = src.read_text(encoding="utf-8")
     assert "cv2.inpaint" not in text
     assert "INPAINT_TELEA" not in text

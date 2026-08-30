@@ -51,7 +51,7 @@ SECTION_TITLES = ("Input", "Mask", "Preview", "Engine", "Run")
 _OVERLAY_COLOR = np.array([15, 98, 254], dtype=np.float32)
 _OVERLAY_ALPHA = 0.45
 _MASK_LAYER_RGBA = (15, 98, 254, 180)
-_STREAM_FIELDS = ("job_id", "engine", "frame_idx", "duration_ms", "error")
+_STREAM_FIELDS = ("job_id", "engine", "resolved_engine", "frame_idx", "duration_ms", "error")
 _TEMP_PREFIXES = ("watermark-remover-out-", "watermark-remover-mask-")
 _STEM_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _ACTIVE_CANCEL_TOKENS: dict[str, dict[str, bool]] = {}
@@ -165,9 +165,7 @@ def detect_ui_candidates(
             f"Status: {len(candidates)} heuristic candidate(s) — "
             "upload a template for better accuracy. Accept or Reject before run"
         )
-    return candidates, (
-        f"Status: {len(candidates)} candidate(s) — Accept or Reject before run"
-    )
+    return candidates, (f"Status: {len(candidates)} candidate(s) — Accept or Reject before run")
 
 
 def template_preview_from_file(
@@ -282,9 +280,7 @@ def confirm_mask_from_sources(
     image_rgb: np.ndarray | None,
     current_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, bool, bool, bool, str]:
-    mask, overlay, ready, _status = preview_mask_from_editor(
-        editor, image_rgb, current_mask
-    )
+    mask, overlay, ready, _status = preview_mask_from_editor(editor, image_rgb, current_mask)
     if not is_run_enabled(mask, True, ready):
         return (
             mask,
@@ -492,13 +488,19 @@ def format_structlog_event(event_dict: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def resolved_engine_from_log(lines: list[str], fallback: EngineName) -> str:
+    for line in reversed(lines):
+        for part in line.split():
+            if part.startswith("resolved_engine="):
+                return part.split("=", 1)[1]
+    return fallback
+
+
 @contextmanager
 def capturing_structlog() -> Iterator[list[str]]:
     lines: list[str] = []
 
-    def processor(
-        logger: object, method_name: str, event_dict: dict[str, Any]
-    ) -> dict[str, Any]:
+    def processor(logger: object, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         del logger, method_name
         formatted = format_structlog_event(event_dict)
         if formatted:
@@ -593,10 +595,12 @@ def run_image_job(
                 started = time.perf_counter()
                 rgb = on_run(image, mask, engine_name, config)
                 duration_ms = round((time.perf_counter() - started) * 1000.0, 2)
+                resolved = resolved_engine_from_log(lines, engine_name)
                 job_log.info(
                     "inpaint_done",
                     job_id=job_id,
                     engine=engine_name,
+                    resolved_engine=resolved,
                     frame_idx=0,
                     duration_ms=duration_ms,
                 )
@@ -630,13 +634,14 @@ def run_image_job(
                     exc_info=True,
                 )
                 return _done(lines, status=f"Status: {exc}")
+            resolved = resolved_engine_from_log(lines, engine_name)
             return _done(
                 lines,
                 image_rgb=rgb,
                 output_path=str(out_path),
                 temp_dir=str(dest_dir),
                 percent=100,
-                status=f"Status: done ({out_name})",
+                status=f"Status: done ({out_name}, engine: {resolved})",
             )
         finally:
             with _CANCEL_LOCK:
@@ -856,9 +861,7 @@ def build_app(settings: Settings | None = None) -> Any:
         confirmed: bool,
         preview_ready_flag: bool,
     ) -> tuple[Any, ...]:
-        mask, replaced, status_text = resolve_imported_mask(
-            file_value, image_rgb, current_mask
-        )
+        mask, replaced, status_text = resolve_imported_mask(file_value, image_rgb, current_mask)
         if not replaced:
             return (
                 current_mask,
@@ -1000,8 +1003,8 @@ def build_app(settings: Settings | None = None) -> Any:
         preview_ready_flag: bool,
         bias: float,
     ) -> tuple[Any, ...]:
-        mask, overlay, new_confirmed, ready, enabled, new_bias, status_text = (
-            accept_ui_candidate(label, candidates, image_rgb, float(bias or 0.0))
+        mask, overlay, new_confirmed, ready, enabled, new_bias, status_text = accept_ui_candidate(
+            label, candidates, image_rgb, float(bias or 0.0)
         )
         if not enabled or mask is None or image_rgb is None:
             return (
@@ -1072,9 +1075,7 @@ def build_app(settings: Settings | None = None) -> Any:
 
         with gr.Group():
             gr.Markdown("## Input")
-            gr.Markdown(
-                f"Supports JPG, PNG, and WEBP. Maximum file size is {max_copy}."
-            )
+            gr.Markdown(f"Supports JPG, PNG, and WEBP. Maximum file size is {max_copy}.")
             input_file = gr.File(
                 label="Open File",
                 file_types=[".jpg", ".jpeg", ".png", ".webp"],

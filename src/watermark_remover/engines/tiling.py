@@ -83,6 +83,7 @@ class TiledInpaint:
                     width=width,
                     overlap=self._overlap,
                 )
+                weights = weights * (tile_mask > 0)
                 acc[y0:y1, x0:x1] += inpainted.astype(np.float64) * weights[..., None]
                 weight_sum[y0:y1, x0:x1] += weights
 
