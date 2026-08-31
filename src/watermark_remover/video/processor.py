@@ -68,6 +68,10 @@ class VideoProcessor:
         self._reject_if_over_ram(target_w, target_h, workers)
 
         log = structlog.get_logger("watermark_remover")
+        if self._settings.temporal_smoothing:
+            mode = "sequential (temporal smoothing enabled)"
+        else:
+            mode = f"parallel ({workers} workers, temporal smoothing disabled)"
         log.info(
             "video_process_start",
             input_path=src.name,
@@ -75,6 +79,8 @@ class VideoProcessor:
             width=target_w,
             height=target_h,
             max_workers=workers,
+            mode=mode,
+            engine=type(engine).__name__,
         )
         _ensure_not_cancelled(cancel_token)
 
@@ -198,32 +204,66 @@ class VideoProcessor:
                 raise EngineError(f"no frames decoded from {src.name}")
             return
 
-        def _write_frame(frame_idx: int, frame: np.ndarray) -> int:
+        def _inpaint_frame(frame_idx: int, frame: np.ndarray) -> tuple[int, np.ndarray]:
+            _ensure_not_cancelled(cancel_token)
             prepared, mask = _prepare(frame_idx, frame)
+            _ensure_not_cancelled(cancel_token)
             result = engine.process(prepared, mask)
-            _write_png(frames_dir / _FRAME_NAME.format(idx=frame_idx // stride), result)
-            return frame_idx
+            return frame_idx, result
 
-        in_flight: dict[Future[int], int] = {}
+        pending: dict[int, np.ndarray] = {}
+        next_encode = 0
+        in_flight: dict[Future[tuple[int, np.ndarray]], int] = {}
+
+        def _flush_ready() -> None:
+            nonlocal next_encode
+            while next_encode in pending:
+                _write_png(
+                    frames_dir / _FRAME_NAME.format(idx=next_encode),
+                    pending.pop(next_encode),
+                )
+                next_encode += 1
+
+        def _take_completed() -> None:
+            if not in_flight:
+                return
+            done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                frame_idx = in_flight.pop(future)
+                try:
+                    done_idx, result = future.result()
+                except ProcessingCancelled:
+                    raise
+                except Exception as exc:
+                    _log_frame_failed(frame_idx, exc)
+                    raise
+                pending[done_idx // stride] = result
+                _flush_ready()
+                _on_done(done_idx)
+
         # Threads, not processes: InpaintEngine (esp. ONNX) is not picklable on Windows spawn.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            try:
-                for frame_idx, frame in extract_frames(src):
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            for frame_idx, frame in extract_frames(src):
+                _ensure_not_cancelled(cancel_token)
+                if frame_idx % stride != 0:
+                    continue
+                while len(in_flight) + len(pending) >= workers:
                     _ensure_not_cancelled(cancel_token)
-                    if frame_idx % stride != 0:
-                        continue
-                    while len(in_flight) >= workers:
-                        _ensure_not_cancelled(cancel_token)
-                        _collect_completed(in_flight, _on_done)
-                    future = pool.submit(_write_frame, frame_idx, frame)
-                    in_flight[future] = frame_idx
-                while in_flight:
-                    _ensure_not_cancelled(cancel_token)
-                    _collect_completed(in_flight, _on_done)
-            except Exception:
-                for future in in_flight:
-                    future.cancel()
-                raise
+                    _take_completed()
+                _ensure_not_cancelled(cancel_token)
+                future = pool.submit(_inpaint_frame, frame_idx, frame)
+                in_flight[future] = frame_idx
+            while in_flight:
+                _ensure_not_cancelled(cancel_token)
+                _take_completed()
+            _flush_ready()
+        except Exception:
+            for future in in_flight:
+                future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
         if completed == 0:
             raise EngineError(f"no frames decoded from {src.name}")
@@ -243,23 +283,6 @@ def _cancel_requested(token: dict[str, Any] | bool | None) -> bool:
 def _ensure_not_cancelled(token: dict[str, Any] | bool | None) -> None:
     if _cancel_requested(token):
         raise ProcessingCancelled("job cancelled")
-
-
-def _collect_completed(
-    in_flight: dict[Future[int], int],
-    on_done: Callable[[int], None],
-) -> None:
-    if not in_flight:
-        return
-    done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
-    for future in done:
-        frame_idx = in_flight.pop(future)
-        try:
-            future.result()
-        except Exception as exc:
-            _log_frame_failed(frame_idx, exc)
-            raise
-        on_done(frame_idx)
 
 
 def _log_frame_failed(frame_idx: int, exc: BaseException) -> None:
