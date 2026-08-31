@@ -45,3 +45,11 @@ def test_max_workers_capped_at_cpu_count(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("watermark_remover.config._cpu_count", lambda: 2)
     settings = Settings(max_workers=128)
     assert settings.max_workers == 2
+
+
+def test_video_settings_defaults() -> None:
+    settings = Settings()
+    assert settings.output_quality == "source"
+    assert settings.keep_audio is True
+    assert settings.frame_stride == 1
+    assert settings.temporal_smoothing is True

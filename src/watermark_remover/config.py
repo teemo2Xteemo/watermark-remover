@@ -96,6 +96,8 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TILE_OVERLAP", "tile_overlap"),
     )
     output_quality: Literal["source", "1080p", "720p"] = "source"
+    keep_audio: bool = True
+    frame_stride: int = Field(default=1, ge=1)
     gradio_server_name: str = "127.0.0.1"
     gradio_share: bool = False
 

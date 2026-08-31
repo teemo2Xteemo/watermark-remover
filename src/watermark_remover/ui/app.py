@@ -17,33 +17,42 @@ import numpy as np
 import structlog
 
 from watermark_remover.config import Settings, get_settings
+from watermark_remover.engines.registry import get_engine, resolved_engine_name
 from watermark_remover.exceptions import (
     EngineError,
     InputValidationError,
     MaskError,
+    ProcessingCancelled,
     ResourceLimitError,
 )
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.io.image import read_image, write_image_atomic
 from watermark_remover.io.validate import (
+    is_video_path,
     refuse_overwrite_unless_flag,
     validate_input_path,
     validate_resolution_limits,
     validate_size_limits,
 )
+from watermark_remover.io.video import probe_video
 from watermark_remover.masks.auto_detect import (
     AutoDetectMaskProvider,
     load_template,
     template_to_display_rgb,
 )
 from watermark_remover.masks.base import MaskCandidate, validate_mask_array
+from watermark_remover.masks.manual import KeyframeMaskProvider, ManualMaskProvider
 from watermark_remover.masks.serialize import (
+    export_keyframes,
     export_mask_json,
     export_mask_png,
+    load_keyframes,
     load_mask_json,
     load_mask_png,
     mask_to_polygon_payload,
 )
+from watermark_remover.video.extract import read_first_frame, read_frame_at
+from watermark_remover.video.processor import VideoProcessor
 
 EngineName = Literal["opencv", "lama", "auto"]
 SECTION_TITLES = ("Input", "Mask", "Preview", "Engine", "Run")
@@ -51,16 +60,45 @@ SECTION_TITLES = ("Input", "Mask", "Preview", "Engine", "Run")
 _OVERLAY_COLOR = np.array([15, 98, 254], dtype=np.float32)
 _OVERLAY_ALPHA = 0.45
 _MASK_LAYER_RGBA = (15, 98, 254, 180)
-_STREAM_FIELDS = ("job_id", "engine", "resolved_engine", "frame_idx", "duration_ms", "error")
+_STREAM_FIELDS = (
+    "job_id",
+    "engine",
+    "resolved_engine",
+    "frame_idx",
+    "duration_ms",
+    "percent",
+    "fps_throughput",
+    "error",
+)
 _TEMP_PREFIXES = ("watermark-remover-out-", "watermark-remover-mask-")
 _STEM_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _ACTIVE_CANCEL_TOKENS: dict[str, dict[str, bool]] = {}
 _CANCEL_LOCK = threading.Lock()
+_PREVIEW_MAX_SIDE = 640
+_STATIC_MODE = "Static (all frames)"
+_KEYFRAME_MODE = "Keyframes (by timestamp)"
+_QUALITY_CHOICES = ("Same as Source", "1080p", "720p")
+_QUALITY_TO_SETTING = {
+    "Same as Source": "source",
+    "1080p": "1080p",
+    "720p": "720p",
+}
 
 
 @dataclass(frozen=True)
 class ImageJobResult:
     image_rgb: np.ndarray | None
+    output_path: str | None
+    temp_dir: str | None
+    log_text: str
+    percent: int
+    job_id: str
+    cancel_requested: bool
+    status: str
+
+
+@dataclass(frozen=True)
+class VideoJobResult:
     output_path: str | None
     temp_dir: str | None
     log_text: str
@@ -658,6 +696,304 @@ def format_byte_limit(max_input_bytes: int) -> str:
     return f"{max_input_bytes} bytes"
 
 
+def downsample_rgb(image: np.ndarray, max_side: int = _PREVIEW_MAX_SIDE) -> np.ndarray:
+    rgb = _as_rgb(image)
+    height, width = int(rgb.shape[0]), int(rgb.shape[1])
+    long_side = max(height, width)
+    if long_side <= max_side:
+        return rgb
+    scale = max_side / float(long_side)
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    return cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def scale_mask_to_hw(
+    mask: np.ndarray | dict[str, Any] | None, frame_hw: tuple[int, int]
+) -> np.ndarray:
+    binary = ui_mask_to_uint8(mask)
+    if binary.shape == frame_hw:
+        return binary
+    resized = cv2.resize(
+        binary,
+        (int(frame_hw[1]), int(frame_hw[0])),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return validate_mask_array(resized)
+
+
+def is_keyframe_mode(mode: str | None) -> bool:
+    return str(mode or "") == _KEYFRAME_MODE
+
+
+def is_video_run_enabled(
+    mode: str | None,
+    mask: np.ndarray | dict[str, Any] | None,
+    mask_confirmed: bool,
+    preview_ready: bool,
+    keyframes: list[dict[str, Any]] | None,
+) -> bool:
+    if not preview_ready:
+        return False
+    if is_keyframe_mode(mode):
+        return _valid_keyframe_count(keyframes) >= 1
+    return is_run_enabled(mask, mask_confirmed, preview_ready)
+
+
+def _valid_keyframe_count(keyframes: list[dict[str, Any]] | None) -> int:
+    count = 0
+    for row in keyframes or []:
+        mask = row.get("mask") if isinstance(row, dict) else None
+        try:
+            binary = ui_mask_to_uint8(mask)
+        except MaskError:
+            continue
+        if int(np.count_nonzero(binary)) > 0:
+            count += 1
+    return count
+
+
+def keyframe_labels(keyframes: list[dict[str, Any]] | None) -> list[str]:
+    labels: list[str] = []
+    for index, row in enumerate(keyframes or []):
+        t = float(row.get("t", 0.0)) if isinstance(row, dict) else 0.0
+        labels.append(f"MASK {index + 1} ({t:.2f}s)")
+    return labels
+
+
+def parse_keyframe_index(label: str | None, count: int) -> int | None:
+    if not label or count <= 0:
+        return None
+    match = re.match(r"MASK\s+(\d+)", str(label))
+    if not match:
+        return None
+    index = int(match.group(1)) - 1
+    if 0 <= index < count:
+        return index
+    return None
+
+
+def hold_last_mask(
+    keyframes: list[dict[str, Any]] | None,
+    timestamp: float,
+    frame_hw: tuple[int, int],
+) -> np.ndarray | None:
+    rows = list(keyframes or [])
+    if not rows:
+        return None
+    chosen: np.ndarray | None = None
+    for row in sorted(rows, key=lambda item: float(item.get("t", 0.0))):
+        t = float(row.get("t", 0.0))
+        if chosen is not None and t > timestamp:
+            break
+        try:
+            chosen = scale_mask_to_hw(row.get("mask"), frame_hw)
+        except MaskError:
+            continue
+    return chosen
+
+
+def load_video_preview(
+    path: Path,
+) -> tuple[np.ndarray, tuple[int, int], float, float, int]:
+    """Return downsampled first-frame RGB plus native (H, W), fps, duration, frame_count."""
+    meta = probe_video(path)
+    first_bgr = read_first_frame(path)
+    preview = downsample_rgb(bgr_to_rgb(first_bgr))
+    return (
+        preview,
+        (int(meta.height), int(meta.width)),
+        float(meta.fps),
+        float(meta.duration),
+        int(meta.frame_count),
+    )
+
+
+def export_session_keyframes(
+    keyframes: list[dict[str, Any]],
+    stem: str,
+    dest_dir: Path,
+    frame_hw: tuple[int, int],
+) -> Path:
+    if _valid_keyframe_count(keyframes) < 1:
+        raise MaskError("at least one keyframe is required")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = safe_output_stem(stem)
+    rows: list[tuple[float, np.ndarray]] = []
+    for row in keyframes:
+        binary = scale_mask_to_hw(row.get("mask"), frame_hw)
+        rows.append((float(row.get("t", 0.0)), binary))
+    json_path = _path_in_dir(dest_dir, f"{safe_stem}.keyframes.json")
+    export_keyframes(json_path, rows, safe_stem)
+    return json_path
+
+
+def import_keyframes_from_path(
+    path: Path,
+    frame_hw: tuple[int, int],
+) -> list[dict[str, Any]]:
+    loaded = load_keyframes(path, frame_hw)
+    return [{"t": float(t), "mask": mask} for t, mask in loaded]
+
+
+def run_video_job(
+    input_path: str | None,
+    engine_name: EngineName,
+    config: Settings,
+    *,
+    mask: np.ndarray | None = None,
+    keyframes: list[dict[str, Any]] | None = None,
+    mask_mode: str = _STATIC_MODE,
+    mask_confirmed: bool = True,
+    preview_ready: bool = True,
+    stem: str = "video",
+    cancel_token: dict[str, Any] | bool | None = None,
+    progress: Any = None,
+) -> VideoJobResult:
+    job_id = new_job_id()
+
+    def _done(
+        lines: list[str],
+        *,
+        output_path: str | None = None,
+        temp_dir: str | None = None,
+        percent: int = 0,
+        status: str,
+        cancelled: bool = False,
+    ) -> VideoJobResult:
+        return VideoJobResult(
+            output_path=output_path,
+            temp_dir=temp_dir,
+            log_text="\n".join(lines),
+            percent=percent,
+            job_id=job_id,
+            cancel_requested=cancelled,
+            status=status,
+        )
+
+    with capturing_structlog() as lines:
+        job_log = structlog.get_logger("watermark_remover.ui")
+        token = cancel_token if isinstance(cancel_token, dict) else {"requested": False}
+        with _CANCEL_LOCK:
+            _ACTIVE_CANCEL_TOKENS[job_id] = token
+        try:
+            job_log.info("job_start", job_id=job_id, engine=engine_name)
+            if _cancel_requested(token):
+                job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
+                return _done(lines, status="Status: cancelled", cancelled=True)
+            if not is_video_run_enabled(
+                mask_mode, mask, mask_confirmed, preview_ready, keyframes
+            ):
+                job_log.info(
+                    "run_blocked",
+                    job_id=job_id,
+                    engine=engine_name,
+                    error="mask not confirmed",
+                )
+                return _done(lines, status="Status: confirm the preview overlay before run")
+            dest_dir: Path | None = None
+            try:
+                if not input_path:
+                    raise InputValidationError("no input video")
+                src = validate_input_path(Path(input_path))
+                if not is_video_path(src):
+                    raise InputValidationError(
+                        f"unsupported video format '{src.suffix}'; expected MP4, MOV, or WEBM"
+                    )
+                validate_size_limits(src, config.max_input_bytes)
+                validate_resolution_limits(src, config)
+                meta = probe_video(src)
+                frame_hw = (int(meta.height), int(meta.width))
+                if is_keyframe_mode(mask_mode):
+                    rows = [
+                        (float(item["t"]), scale_mask_to_hw(item.get("mask"), frame_hw))
+                        for item in (keyframes or [])
+                    ]
+                    provider: ManualMaskProvider | KeyframeMaskProvider = KeyframeMaskProvider(
+                        rows, float(meta.fps)
+                    )
+                    representative = rows[0][1]
+                else:
+                    scaled = scale_mask_to_hw(mask, frame_hw)
+                    provider = ManualMaskProvider(scaled)
+                    representative = scaled
+                engine = get_engine(engine_name, representative, config)
+                resolved = resolved_engine_name(engine)
+                job_log.info(
+                    "engine_selected",
+                    job_id=job_id,
+                    engine=engine_name,
+                    resolved_engine=resolved,
+                )
+
+                def _progress(**kwargs: object) -> None:
+                    payload = {key: value for key, value in kwargs.items() if value is not None}
+                    job_log.info("video_progress", job_id=job_id, engine=engine_name, **payload)
+                    if progress is not None and payload.get("percent") is not None:
+                        fraction = min(max(float(payload["percent"]) / 100.0, 0.0), 1.0)
+                        progress(fraction, desc=f"frame {payload.get('frame_idx')}")
+
+                dest_dir = Path(tempfile.mkdtemp(prefix="watermark-remover-out-"))
+                safe_stem = safe_output_stem(stem)
+                out_name = f"{safe_stem}_inpainted{src.suffix}"
+                out_path = _path_in_dir(dest_dir, out_name)
+                refuse_overwrite_unless_flag(src, out_path, overwrite=False)
+                started = time.perf_counter()
+                VideoProcessor(config).process(
+                    src,
+                    provider,
+                    engine,
+                    out_path,
+                    progress=_progress,
+                    cancel_token=token,
+                )
+                duration_ms = round((time.perf_counter() - started) * 1000.0, 2)
+                if _cancel_requested(token):
+                    cleanup_temp_dir(str(dest_dir))
+                    job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
+                    return _done(lines, status="Status: cancelled", cancelled=True)
+                job_log.info(
+                    "inpaint_done",
+                    job_id=job_id,
+                    engine=engine_name,
+                    resolved_engine=resolved,
+                    duration_ms=duration_ms,
+                )
+            except ProcessingCancelled:
+                if dest_dir is not None:
+                    cleanup_temp_dir(str(dest_dir))
+                job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
+                return _done(lines, status="Status: cancelled", cancelled=True)
+            except (InputValidationError, MaskError, EngineError, ResourceLimitError) as exc:
+                if dest_dir is not None:
+                    cleanup_temp_dir(str(dest_dir))
+                job_log.error(
+                    "ui_run_failed",
+                    job_id=job_id,
+                    engine=engine_name,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                return _done(lines, status=f"Status: {exc}")
+            return _done(
+                lines,
+                output_path=str(out_path),
+                temp_dir=str(dest_dir),
+                percent=100,
+                status=f"Status: done ({out_name}, engine: {resolved})",
+            )
+        finally:
+            with _CANCEL_LOCK:
+                _ACTIVE_CANCEL_TOKENS.pop(job_id, None)
+
+
+def _quality_setting(label: str | None) -> Literal["source", "1080p", "720p"]:
+    mapped = _QUALITY_TO_SETTING.get(str(label or ""), "source")
+    if mapped in {"source", "1080p", "720p"}:
+        return mapped
+    return "source"
+
+
 def _as_rgb(image: np.ndarray) -> np.ndarray:
     arr = np.ascontiguousarray(np.asarray(image), dtype=np.uint8)
     if arr.ndim == 2:
@@ -1054,6 +1390,404 @@ def build_app(settings: Settings | None = None) -> Any:
             status_text,
         )
 
+    def on_open_video(file_value: object) -> tuple[Any, ...]:
+        disabled = _run_update(False)
+        empty_editor = gr.update()
+        empty_radio = gr.update(choices=[], value=None)
+        try:
+            path = _as_path(file_value)
+            if path is None:
+                raise InputValidationError("no input video")
+            validated = validate_input_path(path)
+            if not is_video_path(validated):
+                raise InputValidationError(
+                    f"unsupported video format '{validated.suffix}'; expected MP4, MOV, or WEBM"
+                )
+            validate_size_limits(validated, settings.max_input_bytes)
+            validate_resolution_limits(validated, settings)
+            preview, native_hw, fps, duration, frame_count = load_video_preview(validated)
+        except (InputValidationError, ResourceLimitError, OSError) as exc:
+            return (
+                None,
+                None,
+                0,
+                0,
+                0.0,
+                0.0,
+                0,
+                empty_editor,
+                None,
+                False,
+                False,
+            [],
+            empty_radio,
+            disabled,
+            f"Status: {exc}",
+            None,
+            "video",
+            gr.update(maximum=1, value=0),
+        )
+        editor = _editor_value(preview, None)
+        native_h, native_w = native_hw
+        slider = gr.update(maximum=max(duration, 0.01), value=0)
+        return (
+            str(validated),
+            preview,
+            native_h,
+            native_w,
+            fps,
+            duration,
+            frame_count,
+            editor,
+            None,
+            False,
+            False,
+            [],
+            empty_radio,
+            disabled,
+            "Status: video loaded — draw a mask on the first frame (downsampled preview)",
+            preview,
+            validated.stem,
+            slider,
+        )
+
+    def on_video_mask_mode(mode: str) -> tuple[Any, ...]:
+        return (
+            gr.update(visible=is_keyframe_mode(mode)),
+            _run_update(False),
+            "Status: choose Static or Keyframes, then confirm a mask overlay",
+        )
+
+    def on_video_update_preview(
+        editor: dict[str, Any] | None,
+        preview_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        preview: np.ndarray | None,
+        confirmed: bool,
+        preview_ready_flag: bool,
+        mode: str,
+        keyframes: list[dict[str, Any]] | None,
+    ) -> tuple[Any, ...]:
+        mask, overlay, ready, status_text = preview_mask_from_editor(
+            editor, preview_rgb, current_mask
+        )
+        enabled = is_video_run_enabled(
+            mode, mask if ready else current_mask, confirmed, ready, keyframes
+        )
+        if not ready:
+            return (
+                current_mask,
+                preview if overlay is None else overlay,
+                confirmed,
+                preview_ready_flag,
+                _run_update(
+                    is_video_run_enabled(
+                        mode, current_mask, confirmed, preview_ready_flag, keyframes
+                    )
+                ),
+                status_text,
+            )
+        if is_keyframe_mode(mode):
+            return mask, overlay, False, True, _run_update(enabled), status_text
+        return mask, overlay, False, True, _run_update(False), status_text
+
+    def on_video_confirm_mask(
+        editor: dict[str, Any] | None,
+        preview_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        preview: np.ndarray | None,
+        mode: str,
+        keyframes: list[dict[str, Any]] | None,
+    ) -> tuple[Any, ...]:
+        mask, overlay, confirmed, ready, enabled, status_text = confirm_mask_from_sources(
+            editor, preview_rgb, current_mask
+        )
+        status_text = status_text.replace("Process All", "Apply Inpainting")
+        if is_keyframe_mode(mode):
+            kf_enabled = is_video_run_enabled(mode, mask, True, ready, keyframes)
+            return (
+                current_mask if mask is None else mask,
+                preview if overlay is None else overlay,
+                True if kf_enabled else False,
+                ready,
+                _run_update(kf_enabled),
+                (
+                    "Status: keyframe mask ready — Add Mask Keyframe to store it"
+                    if ready
+                    else status_text
+                ),
+            )
+        if not enabled:
+            return (
+                current_mask if mask is None else mask,
+                preview if overlay is None else overlay,
+                False,
+                ready,
+                _run_update(False),
+                status_text,
+            )
+        return mask, overlay, True, True, _run_update(True), status_text
+
+    def on_video_add_bbox(
+        preview_rgb: np.ndarray | None,
+        mask: np.ndarray | None,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        mode: str,
+        keyframes: list[dict[str, Any]] | None,
+    ) -> tuple[Any, ...]:
+        disabled = _run_update(False)
+        if preview_rgb is None:
+            return None, gr.update(), None, False, False, disabled, "Status: waiting for input"
+        frame_hw = (int(preview_rgb.shape[0]), int(preview_rgb.shape[1]))
+        combined = union_bbox_mask(mask, frame_hw, int(x), int(y), int(width), int(height))
+        overlay = overlay_mask_rgb(preview_rgb, combined)
+        editor = _editor_value(_as_rgb(preview_rgb), combined)
+        enabled = is_video_run_enabled(mode, combined, False, True, keyframes)
+        return (
+            combined,
+            editor,
+            overlay,
+            False,
+            True,
+            _run_update(enabled if is_keyframe_mode(mode) else False),
+            "Status: bbox added — confirm the overlay before run",
+        )
+
+    def on_add_mask_keyframe(
+        editor: dict[str, Any] | None,
+        preview_rgb: np.ndarray | None,
+        current_mask: np.ndarray | None,
+        keyframes: list[dict[str, Any]] | None,
+        timestamp: float,
+    ) -> tuple[Any, ...]:
+        if preview_rgb is None:
+            return (
+                keyframes or [],
+                gr.update(),
+                current_mask,
+                None,
+                False,
+                False,
+                _run_update(False),
+                "Status: waiting for input",
+            )
+        mask, overlay, ready, status_text = preview_mask_from_editor(
+            editor, preview_rgb, current_mask
+        )
+        if not ready or mask is None:
+            enabled = is_video_run_enabled(
+                _KEYFRAME_MODE, current_mask, True, True, keyframes
+            )
+            return (
+                keyframes or [],
+                gr.update(),
+                current_mask,
+                overlay,
+                False,
+                False,
+                _run_update(enabled),
+                status_text,
+            )
+        t = max(float(timestamp or 0.0), 0.0)
+        rows = list(keyframes or [])
+        rows.append({"t": t, "mask": mask})
+        labels = keyframe_labels(rows)
+        return (
+            rows,
+            gr.update(choices=labels, value=labels[-1]),
+            mask,
+            overlay,
+            True,
+            True,
+            _run_update(True),
+            f"Status: MASK {len(rows)} added at {t:.2f}s — Apply Inpainting is enabled",
+        )
+
+    def on_select_keyframe(
+        label: str | None,
+        keyframes: list[dict[str, Any]] | None,
+        preview_rgb: np.ndarray | None,
+    ) -> tuple[Any, ...]:
+        rows = list(keyframes or [])
+        index = parse_keyframe_index(label, len(rows))
+        if preview_rgb is None or index is None:
+            return None, gr.update(), None, False, "Status: select MASK 1"
+        mask = rows[index]["mask"]
+        overlay = overlay_mask_rgb(preview_rgb, mask)
+        editor = _editor_value(_as_rgb(preview_rgb), mask)
+        return (
+            mask,
+            editor,
+            overlay,
+            True,
+            f"Status: {label} selected",
+        )
+
+    def on_preview_timestamp(
+        timestamp: float,
+        keyframes: list[dict[str, Any]] | None,
+        preview_rgb: np.ndarray | None,
+        video_path: str | None,
+        fps: float,
+        native_h: int,
+        native_w: int,
+        mode: str,
+        current_mask: np.ndarray | None,
+    ) -> tuple[Any, ...]:
+        if preview_rgb is None:
+            return None, "Status: waiting for input"
+        frame_rgb = preview_rgb
+        if video_path and fps > 0:
+            frame_idx = int(round(max(float(timestamp or 0.0), 0.0) * float(fps)))
+            try:
+                frame_bgr = read_frame_at(Path(video_path), frame_idx)
+                frame_rgb = downsample_rgb(bgr_to_rgb(frame_bgr))
+            except (InputValidationError, OSError):
+                frame_rgb = preview_rgb
+        hw = (int(frame_rgb.shape[0]), int(frame_rgb.shape[1]))
+        if is_keyframe_mode(mode):
+            mask = hold_last_mask(keyframes, float(timestamp or 0.0), hw)
+        else:
+            mask = current_mask
+        if mask is None:
+            return frame_rgb, "Status: no mask overlay for this timestamp"
+        overlay = overlay_mask_rgb(frame_rgb, mask)
+        return overlay, "Status: overlay at this timestamp (hold-last)"
+
+    def on_import_video_keyframes(
+        file_value: object,
+        preview_rgb: np.ndarray | None,
+        native_h: int,
+        native_w: int,
+        current_rows: list[dict[str, Any]] | None,
+    ) -> tuple[Any, ...]:
+        if preview_rgb is None:
+            return (
+                current_rows or [],
+                gr.update(),
+                None,
+                gr.update(),
+                None,
+                False,
+                False,
+                _run_update(False),
+                "Status: waiting for input",
+            )
+        try:
+            path = _as_path(file_value)
+            if path is None:
+                raise MaskError("no keyframes file")
+            frame_hw = (int(native_h), int(native_w))
+            rows = import_keyframes_from_path(path, frame_hw)
+            preview_hw = (int(preview_rgb.shape[0]), int(preview_rgb.shape[1]))
+            display_rows = [
+                {"t": item["t"], "mask": scale_mask_to_hw(item["mask"], preview_hw)}
+                for item in rows
+            ]
+        except (MaskError, OSError, InputValidationError) as exc:
+            enabled = is_video_run_enabled(
+                _KEYFRAME_MODE, None, True, True, current_rows
+            )
+            return (
+                current_rows or [],
+                gr.update(),
+                None,
+                gr.update(),
+                None,
+                False,
+                False,
+                _run_update(enabled),
+                f"Status: {exc}",
+            )
+        first = display_rows[0]["mask"]
+        overlay = overlay_mask_rgb(preview_rgb, first)
+        editor = _editor_value(_as_rgb(preview_rgb), first)
+        labels = keyframe_labels(display_rows)
+        return (
+            display_rows,
+            gr.update(choices=labels, value=labels[0]),
+            first,
+            editor,
+            overlay,
+            True,
+            True,
+            _run_update(True),
+            f"Status: imported {len(display_rows)} keyframe(s) — confirm overlay before run",
+        )
+
+    def on_export_video_keyframes(
+        keyframes: list[dict[str, Any]] | None,
+        stem: str | None,
+        native_h: int,
+        native_w: int,
+    ) -> tuple[str | None, str]:
+        if _valid_keyframe_count(keyframes) < 1:
+            return None, "Status: nothing to export"
+        dest = Path(tempfile.mkdtemp(prefix="watermark-remover-mask-"))
+        json_path = export_session_keyframes(
+            list(keyframes or []),
+            stem or "video",
+            dest,
+            (int(native_h), int(native_w)),
+        )
+        return str(json_path), f"Status: exported {json_path.name}"
+
+    def on_process_video(
+        video_path: str | None,
+        mask: np.ndarray | None,
+        mask_confirmed: bool,
+        preview_ready_flag: bool,
+        mode: str,
+        keyframes: list[dict[str, Any]] | None,
+        engine: str,
+        radius: float,
+        method: str,
+        temporal: bool,
+        quality_label: str,
+        nth: float,
+        keep_audio: bool,
+        stem: str | None,
+        job_temp: str | None,
+        progress=gr.Progress(),
+    ) -> tuple[Any, ...]:
+        cleanup_temp_dir(job_temp)
+        stride = max(1, int(nth or 1))
+        cfg = settings.model_copy(
+            update={
+                "opencv_radius": max(int(radius), 1),
+                "opencv_method": "ns" if method == "ns" else "telea",
+                "temporal_smoothing": bool(temporal),
+                "output_quality": _quality_setting(quality_label),
+                "frame_stride": stride,
+                "keep_audio": bool(keep_audio),
+            }
+        )
+        job = run_video_job(
+            video_path,
+            _engine_name(engine),
+            cfg,
+            mask=mask,
+            keyframes=list(keyframes or []),
+            mask_mode=str(mode or _STATIC_MODE),
+            mask_confirmed=mask_confirmed,
+            preview_ready=preview_ready_flag,
+            stem=stem or "video",
+            cancel_token={"requested": False},
+            progress=progress,
+        )
+        return (
+            job.output_path,
+            job.temp_dir,
+            job.log_text,
+            job.percent,
+            job.job_id,
+            {"requested": False},
+            job.status,
+        )
+
     with gr.Blocks(
         title="watermark-remover",
         analytics_enabled=False,
@@ -1069,158 +1803,338 @@ def build_app(settings: Settings | None = None) -> Any:
         threshold_bias = gr.State(0.0)
         job_temp_state = gr.State(None)
         cancel_state = gr.State({"requested": False})
+        video_path_state = gr.State(None)
+        video_preview_state = gr.State(None)
+        video_native_h = gr.State(0)
+        video_native_w = gr.State(0)
+        video_fps_state = gr.State(0.0)
+        video_duration_state = gr.State(0.0)
+        video_frame_count_state = gr.State(0)
+        video_mask_state = gr.State(None)
+        video_mask_confirmed = gr.State(False)
+        video_preview_ready = gr.State(False)
+        video_keyframes_state = gr.State([])
+        video_stem_state = gr.State("video")
+        video_job_temp_state = gr.State(None)
 
         gr.Markdown("# watermark-remover")
-        gr.Markdown("Image mode — local inpainting. No cloud calls.")
+        gr.Markdown("Local inpainting. No cloud calls.")
 
-        with gr.Group():
-            gr.Markdown("## Input")
-            gr.Markdown(f"Supports JPG, PNG, and WEBP. Maximum file size is {max_copy}.")
-            input_file = gr.File(
-                label="Open File",
-                file_types=[".jpg", ".jpeg", ".png", ".webp"],
-                file_count="single",
-                type="filepath",
-            )
-            input_preview = gr.Image(
-                label="Loaded image",
-                type="numpy",
-                interactive=False,
-                buttons=["fullscreen"],
-            )
-
-        with gr.Group():
-            gr.Markdown("## Mask")
-            gr.Markdown(
-                "Draw freehand or add a bounding box, then Update preview. "
-                "In Auto mode, run detection and Accept or Reject each candidate. "
-                "Import/export uses `{stem}.mask.png` and `{stem}.mask.json`."
-            )
-            detection_mode = gr.Radio(
-                label="Detection Mode",
-                choices=["Manual", "Auto"],
-                value="Manual",
-            )
-            mask_editor = gr.ImageEditor(
-                label="Mask editor (freehand)",
-                type="numpy",
-                image_mode="RGB",
-                sources=(),
-                transforms=(),
-                layers=False,
-                brush=gr.Brush(
-                    default_size=20,
-                    colors=["#ef4444"],
-                    color_mode="fixed",
-                    default_color="#ef4444",
-                ),
-                buttons=["fullscreen"],
-            )
-            with gr.Row():
-                bbox_x = gr.Number(label="BBox x", value=0, precision=0)
-                bbox_y = gr.Number(label="BBox y", value=0, precision=0)
-                bbox_w = gr.Number(label="BBox width", value=32, precision=0)
-                bbox_h = gr.Number(label="BBox height", value=32, precision=0)
-            add_bbox_btn = gr.Button("Add bounding box")
-            with gr.Group(visible=False) as auto_group:
-                gr.Markdown("### Auto-detect")
-                gr.Markdown(
-                    "Crop the watermark tightly (PNG with transparency works best). "
-                    "Without a template, heuristics often pick photo details instead."
-                )
-                with gr.Row():
-                    template_file = gr.File(
-                        label="Upload watermark template (PNG/JPG)",
-                        file_types=[".png", ".jpg", ".jpeg", ".webp"],
+        with gr.Tabs():
+            with gr.Tab("Image Mode"):
+                with gr.Group():
+                    gr.Markdown("## Input")
+                    gr.Markdown(f"Supports JPG, PNG, and WEBP. Maximum file size is {max_copy}.")
+                    input_file = gr.File(
+                        label="Open File",
+                        file_types=[".jpg", ".jpeg", ".png", ".webp"],
                         file_count="single",
                         type="filepath",
                     )
-                    template_preview = gr.Image(
-                        label="Template preview",
+                    input_preview = gr.Image(
+                        label="Loaded image",
                         type="numpy",
                         interactive=False,
-                        height=160,
                         buttons=["fullscreen"],
                     )
-                sensitivity_slider = gr.Slider(
-                    label="Sensitivity",
-                    minimum=1,
-                    maximum=100,
-                    value=50,
-                    step=1,
-                )
-                run_detection_btn = gr.Button("Run Detection")
-                candidate_radio = gr.Radio(
-                    label="Candidates",
-                    choices=[],
-                    value=None,
-                )
-                with gr.Row():
-                    accept_btn = gr.Button("Accept")
-                    reject_btn = gr.Button("Reject")
-            with gr.Row():
-                mask_import = gr.File(
-                    label="Import mask (.png / .json)",
-                    file_types=[".png", ".json"],
-                    file_count="single",
-                    type="filepath",
-                )
-                export_png = gr.File(label="Export {stem}.mask.png")
-                export_json = gr.File(label="Export {stem}.mask.json")
-            export_btn = gr.Button("Export mask PNG + JSON")
 
-        with gr.Group():
-            gr.Markdown("## Preview")
-            gr.Markdown("Overlay is required. Confirm it before Process All.")
-            preview_image = gr.Image(
-                label="Mask overlay",
-                type="numpy",
-                interactive=False,
-                buttons=["fullscreen"],
-            )
-            with gr.Row():
-                update_preview_btn = gr.Button("Update preview")
-                confirm_btn = gr.Button("Confirm mask")
+                with gr.Group():
+                    gr.Markdown("## Mask")
+                    gr.Markdown(
+                        "Draw freehand or add a bounding box, then Update preview. "
+                        "In Auto mode, run detection and Accept or Reject each candidate. "
+                        "Import/export uses `{stem}.mask.png` and `{stem}.mask.json`."
+                    )
+                    detection_mode = gr.Radio(
+                        label="Detection Mode",
+                        choices=["Manual", "Auto"],
+                        value="Manual",
+                    )
+                    mask_editor = gr.ImageEditor(
+                        label="Mask editor (freehand)",
+                        type="numpy",
+                        image_mode="RGB",
+                        sources=(),
+                        transforms=(),
+                        layers=False,
+                        brush=gr.Brush(
+                            default_size=20,
+                            colors=["#ef4444"],
+                            color_mode="fixed",
+                            default_color="#ef4444",
+                        ),
+                        buttons=["fullscreen"],
+                    )
+                    with gr.Row():
+                        bbox_x = gr.Number(label="BBox x", value=0, precision=0)
+                        bbox_y = gr.Number(label="BBox y", value=0, precision=0)
+                        bbox_w = gr.Number(label="BBox width", value=32, precision=0)
+                        bbox_h = gr.Number(label="BBox height", value=32, precision=0)
+                    add_bbox_btn = gr.Button("Add bounding box")
+                    with gr.Group(visible=False) as auto_group:
+                        gr.Markdown("### Auto-detect")
+                        gr.Markdown(
+                            "Crop the watermark tightly (PNG with transparency works best). "
+                            "Without a template, heuristics often pick photo details instead."
+                        )
+                        with gr.Row():
+                            template_file = gr.File(
+                                label="Upload watermark template (PNG/JPG)",
+                                file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                                file_count="single",
+                                type="filepath",
+                            )
+                            template_preview = gr.Image(
+                                label="Template preview",
+                                type="numpy",
+                                interactive=False,
+                                height=160,
+                                buttons=["fullscreen"],
+                            )
+                        sensitivity_slider = gr.Slider(
+                            label="Sensitivity",
+                            minimum=1,
+                            maximum=100,
+                            value=50,
+                            step=1,
+                        )
+                        run_detection_btn = gr.Button("Run Detection")
+                        candidate_radio = gr.Radio(
+                            label="Candidates",
+                            choices=[],
+                            value=None,
+                        )
+                        with gr.Row():
+                            accept_btn = gr.Button("Accept")
+                            reject_btn = gr.Button("Reject")
+                    with gr.Row():
+                        mask_import = gr.File(
+                            label="Import mask (.png / .json)",
+                            file_types=[".png", ".json"],
+                            file_count="single",
+                            type="filepath",
+                        )
+                        export_png = gr.File(label="Export {stem}.mask.png")
+                        export_json = gr.File(label="Export {stem}.mask.json")
+                    export_btn = gr.Button("Export mask PNG + JSON")
 
-        with gr.Group():
-            gr.Markdown("## Engine")
-            engine = gr.Dropdown(
-                label="Engine",
-                choices=["opencv", "lama", "auto"],
-                value="opencv",
-            )
-            gr.Markdown(gpu_status)
-            with gr.Accordion("Advanced Settings", open=False):
-                radius = gr.Number(label="radius", value=settings.opencv_radius, precision=0)
-                method = gr.Radio(
-                    label="method",
-                    choices=["telea", "ns"],
-                    value=settings.opencv_method,
-                )
-                gr.Markdown(f"Use GPU (CUDA): {'Active' if cuda_available() else 'Unavailable'}")
+                with gr.Group():
+                    gr.Markdown("## Preview")
+                    gr.Markdown("Overlay is required. Confirm it before Process All.")
+                    preview_image = gr.Image(
+                        label="Mask overlay",
+                        type="numpy",
+                        interactive=False,
+                        buttons=["fullscreen"],
+                    )
+                    with gr.Row():
+                        update_preview_btn = gr.Button("Update preview")
+                        confirm_btn = gr.Button("Confirm mask")
 
-        with gr.Group():
-            gr.Markdown("## Run")
-            with gr.Row():
-                run_btn = gr.Button("Process All", interactive=False, variant="primary")
-                cancel_btn = gr.Button("Cancel")
-            job_id_box = gr.Textbox(label="job_id", interactive=False)
-            percent = gr.Slider(
-                label="Progress %",
-                minimum=0,
-                maximum=100,
-                value=0,
-                interactive=False,
-            )
-            log_box = gr.Textbox(label="Log", lines=8, interactive=False)
-            result_image = gr.Image(
-                label="Result",
-                type="numpy",
-                interactive=False,
-                buttons=["fullscreen"],
-            )
-            download = gr.File(label="Download result")
-            status = gr.Markdown("Status: Waiting for input")
+                with gr.Group():
+                    gr.Markdown("## Engine")
+                    engine = gr.Dropdown(
+                        label="Engine",
+                        choices=["opencv", "lama", "auto"],
+                        value="opencv",
+                    )
+                    gr.Markdown(gpu_status)
+                    with gr.Accordion("Advanced Settings", open=False):
+                        radius = gr.Number(
+                            label="radius", value=settings.opencv_radius, precision=0
+                        )
+                        method = gr.Radio(
+                            label="method",
+                            choices=["telea", "ns"],
+                            value=settings.opencv_method,
+                        )
+                        gr.Markdown(
+                            f"Use GPU (CUDA): {'Active' if cuda_available() else 'Unavailable'}"
+                        )
+
+                with gr.Group():
+                    gr.Markdown("## Run")
+                    with gr.Row():
+                        run_btn = gr.Button("Process All", interactive=False, variant="primary")
+                        cancel_btn = gr.Button("Cancel")
+                    job_id_box = gr.Textbox(label="job_id", interactive=False)
+                    percent = gr.Slider(
+                        label="Progress %",
+                        minimum=0,
+                        maximum=100,
+                        value=0,
+                        interactive=False,
+                    )
+                    log_box = gr.Textbox(label="Log", lines=8, interactive=False)
+                    result_image = gr.Image(
+                        label="Result",
+                        type="numpy",
+                        interactive=False,
+                        buttons=["fullscreen"],
+                    )
+                    download = gr.File(label="Download result")
+                    status = gr.Markdown("Status: Waiting for input")
+
+            with gr.Tab("Video Mode"):
+                with gr.Group():
+                    gr.Markdown("## Input")
+                    gr.Markdown(
+                        f"Supports MP4, MOV, and WEBM. Maximum file size is {max_copy}."
+                    )
+                    video_file = gr.File(
+                        label="Open File",
+                        file_types=[".mp4", ".mov", ".webm"],
+                        file_count="single",
+                        type="filepath",
+                    )
+                    video_input_preview = gr.Image(
+                        label="Downsampled preview (first frame)",
+                        type="numpy",
+                        interactive=False,
+                        buttons=["fullscreen"],
+                    )
+
+                with gr.Group():
+                    gr.Markdown("## Mask")
+                    gr.Markdown(
+                        "Draw on the first shown frame. Toggle Static (all frames) or "
+                        "Keyframes (by timestamp). Keyframe mode keeps MASK 1 + Add Mask Keyframe. "
+                        "Export/import uses `{stem}.keyframes.json`."
+                    )
+                    video_mask_mode = gr.Radio(
+                        label="Mask mode",
+                        choices=[_STATIC_MODE, _KEYFRAME_MODE],
+                        value=_STATIC_MODE,
+                    )
+                    video_mask_editor = gr.ImageEditor(
+                        label="Mask editor (first frame)",
+                        type="numpy",
+                        image_mode="RGB",
+                        sources=(),
+                        transforms=(),
+                        layers=False,
+                        brush=gr.Brush(
+                            default_size=20,
+                            colors=["#ef4444"],
+                            color_mode="fixed",
+                            default_color="#ef4444",
+                        ),
+                        buttons=["fullscreen"],
+                    )
+                    with gr.Row():
+                        video_bbox_x = gr.Number(label="BBox x", value=0, precision=0)
+                        video_bbox_y = gr.Number(label="BBox y", value=0, precision=0)
+                        video_bbox_w = gr.Number(label="BBox width", value=32, precision=0)
+                        video_bbox_h = gr.Number(label="BBox height", value=32, precision=0)
+                    video_add_bbox_btn = gr.Button("Add bounding box")
+                    with gr.Group(visible=False) as video_kf_group:
+                        kf_time = gr.Number(
+                            label="Keyframe timestamp (s)", value=0, precision=2
+                        )
+                        add_kf_btn = gr.Button("Add Mask Keyframe")
+                        kf_radio = gr.Radio(
+                            label="MASK 1",
+                            choices=[],
+                            value=None,
+                        )
+                    with gr.Row():
+                        video_kf_import = gr.File(
+                            label="Import {stem}.keyframes.json",
+                            file_types=[".json"],
+                            file_count="single",
+                            type="filepath",
+                        )
+                        video_kf_export = gr.File(label="Export {stem}.keyframes.json")
+                    video_kf_export_btn = gr.Button("Export keyframes JSON")
+
+                with gr.Group():
+                    gr.Markdown("## Preview")
+                    gr.Markdown("Overlay is required before Apply Inpainting.")
+                    video_preview_image = gr.Image(
+                        label="Mask overlay",
+                        type="numpy",
+                        interactive=False,
+                        buttons=["fullscreen"],
+                    )
+                    video_preview_ts = gr.Slider(
+                        label="Preview timestamp (s)",
+                        minimum=0,
+                        maximum=1,
+                        value=0,
+                        step=0.01,
+                    )
+                    with gr.Row():
+                        video_update_preview_btn = gr.Button("Update preview")
+                        video_confirm_btn = gr.Button("Confirm mask")
+                    gr.Markdown(
+                        "Static mode: confirm the overlay. "
+                        "Keyframe mode: add at least one keyframe."
+                    )
+
+                with gr.Group():
+                    gr.Markdown("## Engine")
+                    video_engine = gr.Dropdown(
+                        label="Engine",
+                        choices=["opencv", "lama", "auto"],
+                        value="opencv",
+                    )
+                    gr.Markdown(gpu_status)
+                    with gr.Accordion("Advanced Settings", open=False):
+                        video_radius = gr.Number(
+                            label="radius", value=settings.opencv_radius, precision=0
+                        )
+                        video_method = gr.Radio(
+                            label="method",
+                            choices=["telea", "ns"],
+                            value=settings.opencv_method,
+                        )
+                        gr.Markdown(
+                            f"Use GPU (CUDA): {'Active' if cuda_available() else 'Unavailable'}"
+                        )
+                    video_temporal = gr.Checkbox(
+                        label="Apply Temporal Smoothing",
+                        value=bool(settings.temporal_smoothing),
+                    )
+                    video_quality = gr.Dropdown(
+                        label="Output Quality",
+                        choices=list(_QUALITY_CHOICES),
+                        value=next(
+                            (
+                                label
+                                for label, key in _QUALITY_TO_SETTING.items()
+                                if key == settings.output_quality
+                            ),
+                            "Same as Source",
+                        ),
+                    )
+                    video_nth = gr.Number(
+                        label="Process Nth frame",
+                        value=int(settings.frame_stride),
+                        precision=0,
+                    )
+                    video_keep_audio = gr.Checkbox(
+                        label="Keep Original Audio",
+                        value=bool(settings.keep_audio),
+                    )
+
+                with gr.Group():
+                    gr.Markdown("## Run")
+                    with gr.Row():
+                        video_run_btn = gr.Button(
+                            "Apply Inpainting", interactive=False, variant="primary"
+                        )
+                        video_cancel_btn = gr.Button("Cancel")
+                    video_job_id_box = gr.Textbox(label="job_id", interactive=False)
+                    video_percent = gr.Slider(
+                        label="Progress %",
+                        minimum=0,
+                        maximum=100,
+                        value=0,
+                        interactive=False,
+                    )
+                    video_log_box = gr.Textbox(label="Log", lines=8, interactive=False)
+                    video_download = gr.File(label="Download result")
+                    video_status = gr.Markdown("Status: Waiting for input")
 
         input_file.upload(
             on_open_file,
@@ -1414,6 +2328,212 @@ def build_app(settings: Settings | None = None) -> Any:
             inputs=[job_temp_state, job_id_box],
             outputs=[cancel_state, log_box, percent, status],
             cancels=[run_event],
+        )
+
+        video_file.upload(
+            on_open_video,
+            inputs=[video_file],
+            outputs=[
+                video_path_state,
+                video_preview_state,
+                video_native_h,
+                video_native_w,
+                video_fps_state,
+                video_duration_state,
+                video_frame_count_state,
+                video_mask_editor,
+                video_mask_state,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_keyframes_state,
+                kf_radio,
+                video_run_btn,
+                video_status,
+                video_input_preview,
+                video_stem_state,
+                video_preview_ts,
+            ],
+        )
+        video_mask_mode.change(
+            on_video_mask_mode,
+            inputs=[video_mask_mode],
+            outputs=[video_kf_group, video_run_btn, video_status],
+        )
+        video_preview_inputs = [
+            video_mask_editor,
+            video_preview_state,
+            video_mask_state,
+            video_preview_image,
+            video_mask_confirmed,
+            video_preview_ready,
+            video_mask_mode,
+            video_keyframes_state,
+        ]
+        video_preview_outputs = [
+            video_mask_state,
+            video_preview_image,
+            video_mask_confirmed,
+            video_preview_ready,
+            video_run_btn,
+            video_status,
+        ]
+        video_update_preview_btn.click(
+            on_video_update_preview,
+            inputs=video_preview_inputs,
+            outputs=video_preview_outputs,
+        )
+        video_mask_editor.apply(
+            on_video_update_preview,
+            inputs=video_preview_inputs,
+            outputs=video_preview_outputs,
+        )
+        video_add_bbox_btn.click(
+            on_video_add_bbox,
+            inputs=[
+                video_preview_state,
+                video_mask_state,
+                video_bbox_x,
+                video_bbox_y,
+                video_bbox_w,
+                video_bbox_h,
+                video_mask_mode,
+                video_keyframes_state,
+            ],
+            outputs=[
+                video_mask_state,
+                video_mask_editor,
+                video_preview_image,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_run_btn,
+                video_status,
+            ],
+        )
+        add_kf_btn.click(
+            on_add_mask_keyframe,
+            inputs=[
+                video_mask_editor,
+                video_preview_state,
+                video_mask_state,
+                video_keyframes_state,
+                kf_time,
+            ],
+            outputs=[
+                video_keyframes_state,
+                kf_radio,
+                video_mask_state,
+                video_preview_image,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_run_btn,
+                video_status,
+            ],
+        )
+        kf_radio.change(
+            on_select_keyframe,
+            inputs=[kf_radio, video_keyframes_state, video_preview_state],
+            outputs=[
+                video_mask_state,
+                video_mask_editor,
+                video_preview_image,
+                video_preview_ready,
+                video_status,
+            ],
+        )
+        video_preview_ts.change(
+            on_preview_timestamp,
+            inputs=[
+                video_preview_ts,
+                video_keyframes_state,
+                video_preview_state,
+                video_path_state,
+                video_fps_state,
+                video_native_h,
+                video_native_w,
+                video_mask_mode,
+                video_mask_state,
+            ],
+            outputs=[video_preview_image, video_status],
+        )
+        video_kf_import.upload(
+            on_import_video_keyframes,
+            inputs=[
+                video_kf_import,
+                video_preview_state,
+                video_native_h,
+                video_native_w,
+                video_keyframes_state,
+            ],
+            outputs=[
+                video_keyframes_state,
+                kf_radio,
+                video_mask_state,
+                video_mask_editor,
+                video_preview_image,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_run_btn,
+                video_status,
+            ],
+        )
+        video_kf_export_btn.click(
+            on_export_video_keyframes,
+            inputs=[video_keyframes_state, video_stem_state, video_native_h, video_native_w],
+            outputs=[video_kf_export, video_status],
+        )
+        video_confirm_btn.click(
+            on_video_confirm_mask,
+            inputs=[
+                video_mask_editor,
+                video_preview_state,
+                video_mask_state,
+                video_preview_image,
+                video_mask_mode,
+                video_keyframes_state,
+            ],
+            outputs=[
+                video_mask_state,
+                video_preview_image,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_run_btn,
+                video_status,
+            ],
+        )
+        video_run_event = video_run_btn.click(
+            on_process_video,
+            inputs=[
+                video_path_state,
+                video_mask_state,
+                video_mask_confirmed,
+                video_preview_ready,
+                video_mask_mode,
+                video_keyframes_state,
+                video_engine,
+                video_radius,
+                video_method,
+                video_temporal,
+                video_quality,
+                video_nth,
+                video_keep_audio,
+                video_stem_state,
+                video_job_temp_state,
+            ],
+            outputs=[
+                video_download,
+                video_job_temp_state,
+                video_log_box,
+                video_percent,
+                video_job_id_box,
+                cancel_state,
+                video_status,
+            ],
+        )
+        video_cancel_btn.click(
+            on_cancel,
+            inputs=[video_job_temp_state, video_job_id_box],
+            outputs=[cancel_state, video_log_box, video_percent, video_status],
+            cancels=[video_run_event],
         )
 
     return demo

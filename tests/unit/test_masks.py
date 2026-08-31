@@ -8,10 +8,12 @@ import pytest
 
 from watermark_remover.exceptions import MaskError
 from watermark_remover.masks.base import validate_mask_coverage
-from watermark_remover.masks.manual import ManualMaskProvider
+from watermark_remover.masks.manual import KeyframeMaskProvider, ManualMaskProvider
 from watermark_remover.masks.serialize import (
+    export_keyframes,
     export_mask_json,
     export_mask_png,
+    load_keyframes,
     load_mask_json,
     load_mask_png,
 )
@@ -113,3 +115,61 @@ def test_fixture_masks_are_binary(fixtures_dir: Path) -> None:
         mask = load_mask_png(fixtures_dir / name)
         assert mask.dtype == np.uint8
         assert set(np.unique(mask).tolist()).issubset({0, 255})
+
+
+def test_keyframe_mask_provider_hold_last() -> None:
+    frame = np.zeros((8, 10, 3), dtype=np.uint8)
+    first = np.zeros((8, 10), dtype=np.uint8)
+    first[1:3, 1:3] = 255
+    second = np.zeros((8, 10), dtype=np.uint8)
+    second[4:6, 6:9] = 255
+    provider = KeyframeMaskProvider([(0.0, first), (1.0, second)], fps=10.0)
+    at_start = provider.get_mask(frame, 0)
+    assert np.array_equal(at_start, first)
+    before_switch = provider.get_mask(frame, 9)
+    assert np.array_equal(before_switch, first)
+    at_switch = provider.get_mask(frame, 10)
+    assert np.array_equal(at_switch, second)
+    after = provider.get_mask(frame, 15)
+    assert np.array_equal(after, second)
+
+
+def test_keyframe_mask_provider_requires_keyframes() -> None:
+    with pytest.raises(MaskError, match="at least one keyframe"):
+        KeyframeMaskProvider([], fps=10.0)
+
+
+def test_keyframes_json_roundtrip(tmp_path: Path) -> None:
+    first = np.zeros((6, 8), dtype=np.uint8)
+    first[1:3, 1:4] = 255
+    second = np.zeros((6, 8), dtype=np.uint8)
+    second[2:5, 4:7] = 255
+    dest = tmp_path / "clip.keyframes.json"
+    export_keyframes(dest, [(0.0, first), (1.25, second)], "clip")
+    body = json.loads(dest.read_text(encoding="utf-8"))
+    assert body["schema_version"] == 1
+    assert body["keyframes"][0]["t"] == 0.0
+    assert body["keyframes"][0]["mask_ref"] == "clip.kf.0.png"
+    assert body["keyframes"][1]["mask_ref"] == "clip.kf.1.png"
+    loaded = load_keyframes(dest, (6, 8))
+    assert len(loaded) == 2
+    assert loaded[0][0] == 0.0
+    assert np.array_equal(loaded[0][1], first)
+    assert loaded[1][0] == 1.25
+    assert np.array_equal(loaded[1][1], second)
+
+
+def test_load_keyframes_rejects_unknown_schema(tmp_path: Path) -> None:
+    src = tmp_path / "clip.keyframes.json"
+    src.write_text(json.dumps({"schema_version": 99, "keyframes": [{"t": 0, "mask_ref": "x.png"}]}))
+    with pytest.raises(MaskError, match="schema_version"):
+        load_keyframes(src, (2, 2))
+
+
+def test_fixture_keyframes_json(fixtures_dir: Path) -> None:
+    loaded = load_keyframes(fixtures_dir / "clip_5s.keyframes.json", (48, 64))
+    assert len(loaded) == 2
+    assert loaded[0][0] == 0.0
+    assert loaded[1][0] == 1.0
+    assert loaded[0][1].shape == (48, 64)
+    assert not np.array_equal(loaded[0][1], loaded[1][1])
