@@ -123,7 +123,7 @@ def _parse_frame_rate(value: str | None) -> float:
 
 
 def _ffprobe_metadata(path: Path) -> _FfprobeInfo | None:
-    exe = shutil.which("ffprobe")
+    exe = _find_ffprobe()
     if exe is None:
         return None
     completed = subprocess.run(
@@ -186,3 +186,28 @@ def _ffprobe_metadata(path: Path) -> _FfprobeInfo | None:
         frame_count=frame_count,
         has_audio=audio is not None,
     )
+
+
+def _find_ffprobe() -> str | None:
+    on_path = shutil.which("ffprobe")
+    if on_path:
+        return on_path
+    ffmpeg = shutil.which("ffmpeg")
+    sibling = _ffprobe_sibling(ffmpeg)
+    if sibling:
+        return sibling
+    try:
+        from watermark_remover.video.encode import find_ffmpeg
+    except ImportError:
+        return None
+    return _ffprobe_sibling(find_ffmpeg())
+
+
+def _ffprobe_sibling(ffmpeg: str | None) -> str | None:
+    if not ffmpeg:
+        return None
+    suffix = Path(ffmpeg).suffix
+    sibling = Path(ffmpeg).with_name(f"ffprobe{suffix}")
+    if sibling.is_file():
+        return str(sibling)
+    return None

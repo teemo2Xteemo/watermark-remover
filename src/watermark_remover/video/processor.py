@@ -22,6 +22,7 @@ from watermark_remover.io.video import VideoMetadata, probe_video
 from watermark_remover.masks.base import MaskProvider
 from watermark_remover.video.encode import encode_video
 from watermark_remover.video.extract import extract_frames
+from watermark_remover.video.temporal import TemporalSmoother
 
 _PNG_PARAMS = [int(cv2.IMWRITE_PNG_COMPRESSION), 1]
 _FRAME_NAME = "frame_{idx:08d}.png"
@@ -114,12 +115,6 @@ class VideoProcessor:
         completed = 0
         log = structlog.get_logger("watermark_remover")
 
-        def _write_frame(frame_idx: int, frame: np.ndarray) -> int:
-            mask = mask_provider.get_mask(frame, frame_idx)
-            result = engine.process(frame, mask)
-            _write_png(frames_dir / _FRAME_NAME.format(idx=frame_idx), result)
-            return frame_idx
-
         def _on_done(frame_idx: int) -> None:
             nonlocal completed
             completed += 1
@@ -138,6 +133,27 @@ class VideoProcessor:
                 percent=percent,
                 fps_throughput=round(throughput, 3),
             )
+
+        if self._settings.temporal_smoothing:
+            smoother = TemporalSmoother(self._settings)
+            prev_result: np.ndarray | None = None
+            for frame_idx, frame in extract_frames(src):
+                mask = mask_provider.get_mask(frame, frame_idx)
+                result = engine.process(frame, mask)
+                if prev_result is not None:
+                    result = smoother.apply(prev_result, result, mask)
+                prev_result = result
+                _write_png(frames_dir / _FRAME_NAME.format(idx=frame_idx), result)
+                _on_done(frame_idx)
+            if completed == 0:
+                raise EngineError(f"no frames decoded from {src.name}")
+            return
+
+        def _write_frame(frame_idx: int, frame: np.ndarray) -> int:
+            mask = mask_provider.get_mask(frame, frame_idx)
+            result = engine.process(frame, mask)
+            _write_png(frames_dir / _FRAME_NAME.format(idx=frame_idx), result)
+            return frame_idx
 
         in_flight: dict[Future[int], int] = {}
         # Threads, not processes: InpaintEngine (esp. ONNX) is not picklable on Windows spawn.

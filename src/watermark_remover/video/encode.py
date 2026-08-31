@@ -73,11 +73,39 @@ def _list_frame_files(frames_dir: Path) -> list[Path]:
     return sorted(frames_dir.glob(_FRAME_GLOB))
 
 
+def find_ffmpeg() -> str | None:
+    """Return an ffmpeg executable: system PATH first, then the pip-bundled binary."""
+    on_path = shutil.which("ffmpeg")
+    if on_path:
+        return on_path
+    return _bundled_ffmpeg()
+
+
 def _ffmpeg_bin() -> str:
-    exe = shutil.which("ffmpeg")
+    exe = find_ffmpeg()
     if exe is None:
-        raise EngineError("ffmpeg not found on PATH")
+        raise EngineError(
+            "ffmpeg not found on PATH and no bundled ffmpeg is available "
+            "(pip install imageio-ffmpeg)"
+        )
     return exe
+
+
+def _bundled_ffmpeg() -> str | None:
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        return None
+    try:
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except RuntimeError:
+        return None
+    if not exe:
+        return None
+    path = Path(exe)
+    if path.is_file():
+        return str(path)
+    return shutil.which(exe)
 
 
 def _video_codec_for(suffix: str) -> str:

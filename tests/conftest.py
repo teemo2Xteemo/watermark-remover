@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import cv2
@@ -28,4 +27,6 @@ def pin_seeds() -> None:
 
 @pytest.fixture
 def has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
+    from watermark_remover.video.encode import find_ffmpeg
+
+    return find_ffmpeg() is not None

@@ -11,9 +11,10 @@ from typer.testing import CliRunner
 
 from watermark_remover.cli import app
 from watermark_remover.io.video import probe_video
+from watermark_remover.video.encode import find_ffmpeg
 
 runner = CliRunner()
-_HAS_FFMPEG = shutil.which("ffmpeg") is not None
+_HAS_FFMPEG = find_ffmpeg() is not None
 _FPS_EPS = 0.05
 
 pytestmark = pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg not installed")
@@ -22,12 +23,18 @@ pytestmark = pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg not installed")
 def _run_ffprobe(args: list[str]) -> subprocess.CompletedProcess[str] | None:
     exe = shutil.which("ffprobe")
     if exe is None:
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is not None:
+            sibling = Path(ffmpeg).with_name(f"ffprobe{Path(ffmpeg).suffix}")
+            if sibling.is_file():
+                exe = str(sibling)
+    if exe is None:
         return None
     return subprocess.run([exe, *args], check=False, capture_output=True, text=True)
 
 
 def _ffmpeg_info(path: Path) -> str:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     assert ffmpeg is not None
     completed = subprocess.run(
         [ffmpeg, "-hide_banner", "-i", str(path)],
@@ -93,7 +100,7 @@ def _clip_with_audio(src: Path, tmp_path: Path) -> Path:
         return dest
     meta = probe_video(src)
     duration = meta.duration if meta.duration > 0 else 2.0
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     assert ffmpeg is not None
     completed = subprocess.run(
         [
