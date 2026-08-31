@@ -6,10 +6,16 @@ from watermark_remover.config import Settings
 from watermark_remover.exceptions import InputValidationError, ResourceLimitError
 
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm"})
+MEDIA_SUFFIXES = IMAGE_SUFFIXES | VIDEO_SUFFIXES
 _HEADER_BYTES = 65536
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _BYTES_PER_PIXEL_ESTIMATE = 8
+
+
+def is_video_path(path: Path) -> bool:
+    return Path(path).suffix.lower() in VIDEO_SUFFIXES
 
 
 def validate_input_path(path: Path) -> Path:
@@ -19,9 +25,9 @@ def validate_input_path(path: Path) -> Path:
     if not resolved.is_file():
         raise InputValidationError(f"input is not a file: {resolved.name}")
     suffix = resolved.suffix.lower()
-    if suffix not in IMAGE_SUFFIXES:
+    if suffix not in MEDIA_SUFFIXES:
         raise InputValidationError(
-            f"unsupported image format '{suffix}'; expected JPG, PNG, or WEBP"
+            f"unsupported format '{suffix}'; expected JPG, PNG, WEBP, MP4, MOV, or WEBM"
         )
     return resolved
 
@@ -29,9 +35,7 @@ def validate_input_path(path: Path) -> Path:
 def validate_size_limits(path: Path, max_input_bytes: int) -> None:
     size = Path(path).stat().st_size
     if size > max_input_bytes:
-        raise InputValidationError(
-            f"input exceeds max_input_bytes ({size} > {max_input_bytes})"
-        )
+        raise InputValidationError(f"input exceeds max_input_bytes ({size} > {max_input_bytes})")
 
 
 def default_output_path(input_path: Path) -> Path:
@@ -39,9 +43,7 @@ def default_output_path(input_path: Path) -> Path:
     return src.with_name(f"{src.stem}_inpainted{src.suffix}")
 
 
-def refuse_overwrite_unless_flag(
-    input_path: Path, output_path: Path, overwrite: bool
-) -> None:
+def refuse_overwrite_unless_flag(input_path: Path, output_path: Path, overwrite: bool) -> None:
     try:
         same = Path(input_path).resolve() == Path(output_path).resolve()
     except OSError:
@@ -84,11 +86,25 @@ def probe_image_dimensions(path: Path) -> tuple[int, int]:
     return _webp_dimensions(data)
 
 
+def estimate_working_set_mb(width: int, height: int, copies: int = 1) -> float:
+    """Rough RAM estimate for `copies` uncompressed HxW working buffers."""
+    return (width * height * _BYTES_PER_PIXEL_ESTIMATE * max(1, copies)) / (1024 * 1024)
+
+
 def validate_resolution_limits(path: Path, settings: Settings) -> None:
     if settings.max_ram_mb is None:
         return
-    width, height = probe_image_dimensions(path)
-    estimate_mb = (width * height * _BYTES_PER_PIXEL_ESTIMATE) / (1024 * 1024)
+    src = Path(path)
+    if is_video_path(src):
+        from watermark_remover.io.video import probe_video
+
+        meta = probe_video(src)
+        width, height = meta.width, meta.height
+        copies = int(settings.max_workers)
+    else:
+        width, height = probe_image_dimensions(src)
+        copies = 1
+    estimate_mb = estimate_working_set_mb(width, height, copies)
     if estimate_mb > settings.max_ram_mb:
         raise ResourceLimitError(
             f"estimated working set {estimate_mb:.1f} MiB exceeds max_ram_mb={settings.max_ram_mb}"
