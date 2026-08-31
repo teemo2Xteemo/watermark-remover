@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import stat
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -60,8 +63,7 @@ class VideoProcessor:
 
         tmp_out = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
         try:
-            with tempfile.TemporaryDirectory(prefix="watermark_remover_frames_") as raw:
-                frames_dir = Path(raw)
+            with _frames_temp_dir() as frames_dir:
                 self._process_frames(
                     src=src,
                     meta=meta,
@@ -78,6 +80,7 @@ class VideoProcessor:
                     fps=meta.fps,
                     crf=int(self._settings.crf),
                 )
+                _fsync_file(tmp_out)
             os.replace(tmp_out, dest)
             log.info("video_process_end", output_path=dest.name)
             return dest
@@ -137,6 +140,7 @@ class VideoProcessor:
             )
 
         in_flight: dict[Future[int], int] = {}
+        # Threads, not processes: InpaintEngine (esp. ONNX) is not picklable on Windows spawn.
         with ThreadPoolExecutor(max_workers=workers) as pool:
             try:
                 for frame_idx, frame in extract_frames(src):
@@ -167,14 +171,72 @@ def _collect_completed(
         try:
             future.result()
         except Exception as exc:
-            structlog.get_logger("watermark_remover").error(
-                "frame_failed",
-                frame_idx=frame_idx,
-                error=str(exc),
-                exc_info=True,
-            )
+            _log_frame_failed(frame_idx, exc)
             raise
         on_done(frame_idx)
+
+
+def _log_frame_failed(frame_idx: int, exc: BaseException) -> None:
+    log = structlog.get_logger("watermark_remover")
+    try:
+        log.error("frame_failed", frame_idx=frame_idx, error=str(exc), exc_info=True)
+    except Exception:
+        try:
+            log.error("frame_failed", frame_idx=frame_idx, error=str(exc), exc_info=False)
+        except Exception:
+            pass
+
+
+def _fsync_file(path: Path) -> None:
+    with Path(path).open("r+b") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+@contextlib.contextmanager
+def _frames_temp_dir() -> Iterator[Path]:
+    path = Path(tempfile.mkdtemp(prefix="watermark_remover_frames_"))
+    try:
+        yield path
+    finally:
+        _remove_tree(path)
+
+
+def _remove_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    delays = (0.0, 0.05, 0.15, 0.4)
+    last_error: OSError | None = None
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            shutil.rmtree(path)
+            if not path.exists():
+                return
+        except OSError as exc:
+            last_error = exc
+            _chmod_writable(path)
+    if path.exists():
+        structlog.get_logger("watermark_remover").warning(
+            "temp_cleanup_failed",
+            path=path.name,
+            error=str(last_error) if last_error else "directory still present",
+        )
+
+
+def _chmod_writable(path: Path) -> None:
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+    except OSError:
+        pass
+    if not path.is_dir():
+        return
+    for child in path.rglob("*"):
+        try:
+            os.chmod(child, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        except OSError:
+            continue
 
 
 def _write_png(path: Path, image: np.ndarray) -> None:

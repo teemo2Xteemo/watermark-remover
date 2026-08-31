@@ -52,6 +52,10 @@ app = typer.Typer(
 
 
 def _configure_logging(job_id: str, level: str) -> None:
+    try:
+        sys.stderr.reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
     numeric = getattr(logging, level.upper(), logging.INFO)
     shared = [
         structlog.contextvars.merge_contextvars,

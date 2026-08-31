@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -111,6 +112,7 @@ def test_encode_video_stream_copies_audio(tmp_path: Path, monkeypatch: pytest.Mo
     cmd = calls[0]
     assert "-c:a" in cmd
     assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "1:a:0?" in cmd
     assert "-crf" in cmd
     assert cmd[cmd.index("-crf") + 1] == "23"
     assert "-framerate" in cmd
@@ -139,6 +141,30 @@ def test_encode_video_retries_audio_reencode_when_copy_fails(
     monkeypatch.setattr("watermark_remover.video.encode.subprocess.run", fake_run)
     encode_video(frames_dir, audio_src, output, fps=12.5, crf=18)
     assert output.read_bytes() == b"ok"
+
+
+def test_encode_video_optional_audio_map_allows_source_without_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_00000000.png").write_bytes(b"png")
+    silent = tmp_path / "silent.mp4"
+    _write_tiny_video(silent, frame_count=2)
+    output = tmp_path / "out.mp4"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"video-only")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda name: name)
+    monkeypatch.setattr("watermark_remover.video.encode.subprocess.run", fake_run)
+    encode_video(frames_dir, silent, output, fps=10.0, crf=23)
+    assert "1:a:0?" in calls[0]
+    assert calls[0][calls[0].index("-c:a") + 1] == "copy"
+    assert output.read_bytes() == b"video-only"
 
 
 def test_resource_limit_raised_when_max_ram_mb_set(
@@ -206,6 +232,67 @@ def test_atomic_output_not_left_on_failure(tmp_path: Path) -> None:
         processor.process(src, _StaticMask(), _BoomEngine(), dest)
     assert not dest.exists()
     assert not dest.with_name(f"{dest.stem}.tmp{dest.suffix}").exists()
+
+
+def test_frames_temp_dir_removed_when_encode_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=2)
+    dest = tmp_path / "out.mp4"
+    created: list[Path] = []
+    original = tempfile.mkdtemp
+
+    def fake_mkdtemp(*args: object, **kwargs: object) -> str:
+        options = dict(kwargs)
+        options["dir"] = str(tmp_path)
+        path = original(*args, **options)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("watermark_remover.video.processor.tempfile.mkdtemp", fake_mkdtemp)
+
+    def boom_encode(*_args: object, **_kwargs: object) -> None:
+        raise EngineError("ffmpeg not found on PATH")
+
+    monkeypatch.setattr("watermark_remover.video.processor.encode_video", boom_encode)
+    with pytest.raises(EngineError, match="ffmpeg not found"):
+        VideoProcessor(Settings(max_workers=1)).process(
+            src, _StaticMask(), _PassthroughEngine(), dest
+        )
+    assert created
+    assert all(not path.exists() for path in created)
+    assert list(tmp_path.glob("watermark_remover_frames_*")) == []
+    assert not dest.exists()
+
+
+def test_frame_failed_log_does_not_hide_engine_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=2)
+    dest = tmp_path / "out.mp4"
+
+    class _Cp1252Logger:
+        def info(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def debug(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def warning(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def error(self, *_args: object, **kwargs: object) -> None:
+            raise UnicodeEncodeError("cp1252", "x", 0, 1, "console")
+
+    monkeypatch.setattr(
+        "watermark_remover.video.processor.structlog.get_logger",
+        lambda *_args, **_kwargs: _Cp1252Logger(),
+    )
+    with pytest.raises(EngineError, match="boom"):
+        VideoProcessor(Settings(max_workers=1)).process(src, _StaticMask(), _BoomEngine(), dest)
+    assert not dest.exists()
 
 
 def test_progress_callback_invoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
