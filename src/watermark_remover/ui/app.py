@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import queue
 import re
 import shutil
 import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ from watermark_remover.exceptions import (
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.io.image import read_image, write_image_atomic
 from watermark_remover.io.validate import (
+    estimate_working_set_mb,
     is_video_path,
     refuse_overwrite_unless_flag,
     validate_input_path,
@@ -52,7 +54,7 @@ from watermark_remover.masks.serialize import (
     mask_to_polygon_payload,
 )
 from watermark_remover.video.extract import read_first_frame, read_frame_at
-from watermark_remover.video.processor import VideoProcessor
+from watermark_remover.video.processor import VideoProcessor, capped_max_workers, target_frame_size
 
 EngineName = Literal["opencv", "lama", "auto"]
 SECTION_TITLES = ("Input", "Mask", "Preview", "Engine", "Run")
@@ -733,11 +735,35 @@ def is_video_run_enabled(
     preview_ready: bool,
     keyframes: list[dict[str, Any]] | None,
 ) -> bool:
-    if not preview_ready:
+    if not preview_ready or not mask_confirmed:
         return False
     if is_keyframe_mode(mode):
         return _valid_keyframe_count(keyframes) >= 1
     return is_run_enabled(mask, mask_confirmed, preview_ready)
+
+
+def allowed_output_quality_labels(
+    settings: Settings,
+    width: int,
+    height: int,
+) -> list[str]:
+    """Return Output Quality labels whose capped size fits RAM/VRAM budgets."""
+    ram_cap = settings.max_ram_mb
+    vram_cap = settings.max_vram_mb
+    if ram_cap is None and vram_cap is None:
+        return list(_QUALITY_CHOICES)
+    workers = capped_max_workers(int(settings.max_workers))
+    allowed: list[str] = []
+    for label, key in _QUALITY_TO_SETTING.items():
+        sized = settings.model_copy(update={"output_quality": key})
+        tw, th = target_frame_size(int(width), int(height), sized)
+        estimate = estimate_working_set_mb(tw, th, workers)
+        if ram_cap is not None and estimate > ram_cap:
+            continue
+        if vram_cap is not None and estimate > vram_cap:
+            continue
+        allowed.append(label)
+    return allowed
 
 
 def _valid_keyframe_count(keyframes: list[dict[str, Any]] | None) -> int:
@@ -849,8 +875,10 @@ def run_video_job(
     stem: str = "video",
     cancel_token: dict[str, Any] | bool | None = None,
     progress: Any = None,
+    job_id: str | None = None,
+    on_ui_update: Callable[..., None] | None = None,
 ) -> VideoJobResult:
-    job_id = new_job_id()
+    job_id = job_id or new_job_id()
 
     def _done(
         lines: list[str],
@@ -878,6 +906,8 @@ def run_video_job(
             _ACTIVE_CANCEL_TOKENS[job_id] = token
         try:
             job_log.info("job_start", job_id=job_id, engine=engine_name)
+            if on_ui_update is not None:
+                on_ui_update(percent=0, log_text="\n".join(lines), status="Status: running")
             if _cancel_requested(token):
                 job_log.info("job_cancelled", job_id=job_id, engine=engine_name)
                 return _done(lines, status="Status: cancelled", cancelled=True)
@@ -901,7 +931,6 @@ def run_video_job(
                         f"unsupported video format '{src.suffix}'; expected MP4, MOV, or WEBM"
                     )
                 validate_size_limits(src, config.max_input_bytes)
-                validate_resolution_limits(src, config)
                 meta = probe_video(src)
                 frame_hw = (int(meta.height), int(meta.width))
                 if is_keyframe_mode(mask_mode):
@@ -932,6 +961,14 @@ def run_video_job(
                     if progress is not None and payload.get("percent") is not None:
                         fraction = min(max(float(payload["percent"]) / 100.0, 0.0), 1.0)
                         progress(fraction, desc=f"frame {payload.get('frame_idx')}")
+                    if on_ui_update is not None:
+                        raw_percent = payload.get("percent")
+                        percent_i = int(raw_percent) if isinstance(raw_percent, (int, float)) else 0
+                        on_ui_update(
+                            percent=percent_i,
+                            log_text="\n".join(lines),
+                            status=f"Status: frame {payload.get('frame_idx')}",
+                        )
 
                 dest_dir = Path(tempfile.mkdtemp(prefix="watermark-remover-out-"))
                 safe_stem = safe_output_stem(stem)
@@ -985,6 +1022,86 @@ def run_video_job(
         finally:
             with _CANCEL_LOCK:
                 _ACTIVE_CANCEL_TOKENS.pop(job_id, None)
+
+
+def stream_video_run(
+    *,
+    video_path: str | None,
+    engine_name: EngineName,
+    config: Settings,
+    mask: np.ndarray | None,
+    keyframes: list[dict[str, Any]] | None,
+    mask_mode: str,
+    mask_confirmed: bool,
+    preview_ready: bool,
+    stem: str,
+    job_temp: str | None,
+    cancel_token: dict[str, Any] | bool | None,
+    job_id: str | None = None,
+) -> Iterator[tuple[Any, ...]]:
+    """Yield UI Run outputs so job_id/log/percent update before the job finishes."""
+    token = cancel_token if isinstance(cancel_token, dict) else {"requested": False}
+    job_id = job_id or new_job_id()
+    pending: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    def on_ui_update(*, percent: int, log_text: str, status: str) -> None:
+        pending.put(
+            {
+                "kind": "tick",
+                "percent": int(percent),
+                "log_text": log_text,
+                "status": status,
+            }
+        )
+
+    def worker() -> None:
+        try:
+            job = run_video_job(
+                video_path,
+                engine_name,
+                config,
+                mask=mask,
+                keyframes=keyframes,
+                mask_mode=mask_mode,
+                mask_confirmed=mask_confirmed,
+                preview_ready=preview_ready,
+                stem=stem,
+                cancel_token=token,
+                job_id=job_id,
+                on_ui_update=on_ui_update,
+            )
+            pending.put({"kind": "done", "job": job})
+        except Exception as exc:
+            pending.put({"kind": "error", "error": exc})
+
+    threading.Thread(target=worker, daemon=True).start()
+    yield None, job_temp, "", 0, job_id, token, "Status: running"
+    while True:
+        item = pending.get()
+        kind = item.get("kind")
+        if kind == "done":
+            job = item["job"]
+            yield (
+                job.output_path,
+                job.temp_dir,
+                job.log_text,
+                job.percent,
+                job.job_id,
+                token,
+                job.status,
+            )
+            return
+        if kind == "error":
+            raise item["error"]
+        yield (
+            None,
+            job_temp,
+            item.get("log_text", ""),
+            item.get("percent", 0),
+            job_id,
+            token,
+            item.get("status", "Status: running"),
+        )
 
 
 def _quality_setting(label: str | None) -> Literal["source", "1080p", "720p"]:
@@ -1258,7 +1375,10 @@ def build_app(settings: Settings | None = None) -> Any:
     def on_cancel(
         job_temp: str | None,
         job_id: str | None,
-    ) -> tuple[dict[str, bool], str, int, str]:
+        cancel_state: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], str, int, str]:
+        token = cancel_state if isinstance(cancel_state, dict) else {"requested": False}
+        token["requested"] = True
         request_job_cancel(job_id)
         cleanup_temp_dir(job_temp)
         with capturing_structlog() as lines:
@@ -1267,7 +1387,7 @@ def build_app(settings: Settings | None = None) -> Any:
             if job_id:
                 kwargs["job_id"] = job_id
             job_log.info("job_cancelled", **kwargs)
-        return {"requested": False}, "\n".join(lines), 0, "Status: cancelled"
+        return token, "\n".join(lines), 0, "Status: cancelled"
 
     def on_process(
         image_rgb: np.ndarray | None,
@@ -1390,10 +1510,28 @@ def build_app(settings: Settings | None = None) -> Any:
             status_text,
         )
 
+    def _quality_dropdown(width: int, height: int) -> Any:
+        choices = allowed_output_quality_labels(settings, width, height)
+        if not choices:
+            raise ResourceLimitError(
+                "estimated working set exceeds max_ram_mb/max_vram_mb at every output quality"
+            )
+        preferred = next(
+            (
+                label
+                for label, key in _QUALITY_TO_SETTING.items()
+                if key == settings.output_quality
+            ),
+            "Same as Source",
+        )
+        value = preferred if preferred in choices else choices[0]
+        return gr.update(choices=choices, value=value)
+
     def on_open_video(file_value: object) -> tuple[Any, ...]:
         disabled = _run_update(False)
         empty_editor = gr.update()
         empty_radio = gr.update(choices=[], value=None)
+        default_quality = gr.update(choices=list(_QUALITY_CHOICES), value="Same as Source")
         try:
             path = _as_path(file_value)
             if path is None:
@@ -1404,8 +1542,9 @@ def build_app(settings: Settings | None = None) -> Any:
                     f"unsupported video format '{validated.suffix}'; expected MP4, MOV, or WEBM"
                 )
             validate_size_limits(validated, settings.max_input_bytes)
-            validate_resolution_limits(validated, settings)
             preview, native_hw, fps, duration, frame_count = load_video_preview(validated)
+            native_h, native_w = native_hw
+            quality_update = _quality_dropdown(native_w, native_h)
         except (InputValidationError, ResourceLimitError, OSError) as exc:
             return (
                 None,
@@ -1419,16 +1558,16 @@ def build_app(settings: Settings | None = None) -> Any:
                 None,
                 False,
                 False,
-            [],
-            empty_radio,
-            disabled,
-            f"Status: {exc}",
-            None,
-            "video",
-            gr.update(maximum=1, value=0),
-        )
+                [],
+                empty_radio,
+                disabled,
+                f"Status: {exc}",
+                None,
+                "video",
+                gr.update(maximum=1, value=0),
+                default_quality,
+            )
         editor = _editor_value(preview, None)
-        native_h, native_w = native_hw
         slider = gr.update(maximum=max(duration, 0.01), value=0)
         return (
             str(validated),
@@ -1449,6 +1588,7 @@ def build_app(settings: Settings | None = None) -> Any:
             preview,
             validated.stem,
             slider,
+            quality_update,
         )
 
     def on_video_mask_mode(mode: str) -> tuple[Any, ...]:
@@ -1471,9 +1611,6 @@ def build_app(settings: Settings | None = None) -> Any:
         mask, overlay, ready, status_text = preview_mask_from_editor(
             editor, preview_rgb, current_mask
         )
-        enabled = is_video_run_enabled(
-            mode, mask if ready else current_mask, confirmed, ready, keyframes
-        )
         if not ready:
             return (
                 current_mask,
@@ -1487,8 +1624,6 @@ def build_app(settings: Settings | None = None) -> Any:
                 ),
                 status_text,
             )
-        if is_keyframe_mode(mode):
-            return mask, overlay, False, True, _run_update(enabled), status_text
         return mask, overlay, False, True, _run_update(False), status_text
 
     def on_video_confirm_mask(
@@ -1505,17 +1640,19 @@ def build_app(settings: Settings | None = None) -> Any:
         status_text = status_text.replace("Process All", "Apply Inpainting")
         if is_keyframe_mode(mode):
             kf_enabled = is_video_run_enabled(mode, mask, True, ready, keyframes)
+            if ready and _valid_keyframe_count(keyframes) < 1:
+                status_kf = "Status: overlay confirmed — Add Mask Keyframe to store it"
+            elif kf_enabled:
+                status_kf = "Status: mask confirmed — Apply Inpainting is enabled"
+            else:
+                status_kf = status_text
             return (
                 current_mask if mask is None else mask,
                 preview if overlay is None else overlay,
-                True if kf_enabled else False,
+                True if ready else False,
                 ready,
                 _run_update(kf_enabled),
-                (
-                    "Status: keyframe mask ready — Add Mask Keyframe to store it"
-                    if ready
-                    else status_text
-                ),
+                status_kf,
             )
         if not enabled:
             return (
@@ -1545,14 +1682,13 @@ def build_app(settings: Settings | None = None) -> Any:
         combined = union_bbox_mask(mask, frame_hw, int(x), int(y), int(width), int(height))
         overlay = overlay_mask_rgb(preview_rgb, combined)
         editor = _editor_value(_as_rgb(preview_rgb), combined)
-        enabled = is_video_run_enabled(mode, combined, False, True, keyframes)
         return (
             combined,
             editor,
             overlay,
             False,
             True,
-            _run_update(enabled if is_keyframe_mode(mode) else False),
+            _run_update(False),
             "Status: bbox added — confirm the overlay before run",
         )
 
@@ -1562,6 +1698,7 @@ def build_app(settings: Settings | None = None) -> Any:
         current_mask: np.ndarray | None,
         keyframes: list[dict[str, Any]] | None,
         timestamp: float,
+        confirmed: bool,
     ) -> tuple[Any, ...]:
         if preview_rgb is None:
             return (
@@ -1579,14 +1716,14 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         if not ready or mask is None:
             enabled = is_video_run_enabled(
-                _KEYFRAME_MODE, current_mask, True, True, keyframes
+                _KEYFRAME_MODE, current_mask, confirmed, True, keyframes
             )
             return (
                 keyframes or [],
                 gr.update(),
                 current_mask,
                 overlay,
-                False,
+                confirmed,
                 False,
                 _run_update(enabled),
                 status_text,
@@ -1595,15 +1732,21 @@ def build_app(settings: Settings | None = None) -> Any:
         rows = list(keyframes or [])
         rows.append({"t": t, "mask": mask})
         labels = keyframe_labels(rows)
+        enabled = is_video_run_enabled(_KEYFRAME_MODE, mask, confirmed, True, rows)
+        status_kf = f"Status: MASK {len(rows)} added at {t:.2f}s"
+        if enabled:
+            status_kf += " — Apply Inpainting is enabled"
+        else:
+            status_kf += " — confirm overlay before run"
         return (
             rows,
             gr.update(choices=labels, value=labels[-1]),
             mask,
             overlay,
+            confirmed,
             True,
-            True,
-            _run_update(True),
-            f"Status: MASK {len(rows)} added at {t:.2f}s — Apply Inpainting is enabled",
+            _run_update(enabled),
+            status_kf,
         )
 
     def on_select_keyframe(
@@ -1689,7 +1832,7 @@ def build_app(settings: Settings | None = None) -> Any:
             ]
         except (MaskError, OSError, InputValidationError) as exc:
             enabled = is_video_run_enabled(
-                _KEYFRAME_MODE, None, True, True, current_rows
+                _KEYFRAME_MODE, None, False, True, current_rows
             )
             return (
                 current_rows or [],
@@ -1712,9 +1855,9 @@ def build_app(settings: Settings | None = None) -> Any:
             first,
             editor,
             overlay,
+            False,
             True,
-            True,
-            _run_update(True),
+            _run_update(False),
             f"Status: imported {len(display_rows)} keyframe(s) — confirm overlay before run",
         )
 
@@ -1751,8 +1894,9 @@ def build_app(settings: Settings | None = None) -> Any:
         keep_audio: bool,
         stem: str | None,
         job_temp: str | None,
+        cancel_state: dict[str, Any] | None,
         progress=gr.Progress(),
-    ) -> tuple[Any, ...]:
+    ) -> Iterator[tuple[Any, ...]]:
         cleanup_temp_dir(job_temp)
         stride = max(1, int(nth or 1))
         cfg = settings.model_copy(
@@ -1765,28 +1909,31 @@ def build_app(settings: Settings | None = None) -> Any:
                 "keep_audio": bool(keep_audio),
             }
         )
-        job = run_video_job(
-            video_path,
-            _engine_name(engine),
-            cfg,
+        token = cancel_state if isinstance(cancel_state, dict) else {"requested": False}
+        token["requested"] = False
+        for update in stream_video_run(
+            video_path=video_path,
+            engine_name=_engine_name(engine),
+            config=cfg,
             mask=mask,
             keyframes=list(keyframes or []),
             mask_mode=str(mode or _STATIC_MODE),
             mask_confirmed=mask_confirmed,
             preview_ready=preview_ready_flag,
             stem=stem or "video",
-            cancel_token={"requested": False},
-            progress=progress,
-        )
-        return (
-            job.output_path,
-            job.temp_dir,
-            job.log_text,
-            job.percent,
-            job.job_id,
-            {"requested": False},
-            job.status,
-        )
+            job_temp=job_temp,
+            cancel_token=token,
+        ):
+            out_path, temp_dir, log_text, percent, job_id, tok, status = update
+            if progress is not None and percent:
+                progress(
+                    min(max(float(percent) / 100.0, 0.0), 1.0),
+                    desc=str(status),
+                )
+            if out_path is None:
+                yield gr.skip(), temp_dir, log_text, percent, job_id, tok, status
+            else:
+                yield out_path, temp_dir, log_text, percent, job_id, tok, status
 
     with gr.Blocks(
         title="watermark-remover",
@@ -2068,7 +2215,7 @@ def build_app(settings: Settings | None = None) -> Any:
                         video_confirm_btn = gr.Button("Confirm mask")
                     gr.Markdown(
                         "Static mode: confirm the overlay. "
-                        "Keyframe mode: add at least one keyframe."
+                        "Keyframe mode: add at least one keyframe, then confirm the overlay."
                     )
 
                 with gr.Group():
@@ -2325,7 +2472,7 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         cancel_btn.click(
             on_cancel,
-            inputs=[job_temp_state, job_id_box],
+            inputs=[job_temp_state, job_id_box, cancel_state],
             outputs=[cancel_state, log_box, percent, status],
             cancels=[run_event],
         )
@@ -2352,6 +2499,7 @@ def build_app(settings: Settings | None = None) -> Any:
                 video_input_preview,
                 video_stem_state,
                 video_preview_ts,
+                video_quality,
             ],
         )
         video_mask_mode.change(
@@ -2417,6 +2565,7 @@ def build_app(settings: Settings | None = None) -> Any:
                 video_mask_state,
                 video_keyframes_state,
                 kf_time,
+                video_mask_confirmed,
             ],
             outputs=[
                 video_keyframes_state,
@@ -2518,6 +2667,7 @@ def build_app(settings: Settings | None = None) -> Any:
                 video_keep_audio,
                 video_stem_state,
                 video_job_temp_state,
+                cancel_state,
             ],
             outputs=[
                 video_download,
@@ -2531,7 +2681,7 @@ def build_app(settings: Settings | None = None) -> Any:
         )
         video_cancel_btn.click(
             on_cancel,
-            inputs=[video_job_temp_state, video_job_id_box],
+            inputs=[video_job_temp_state, video_job_id_box, cancel_state],
             outputs=[cancel_state, video_log_box, video_percent, video_status],
             cancels=[video_run_event],
         )

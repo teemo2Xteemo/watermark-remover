@@ -94,6 +94,18 @@ def test_video_ui_keyframe_run_end_to_end(fixtures_dir: Path, tmp_path: Path) ->
         Settings(max_workers=1, temporal_smoothing=True, keep_audio=True, frame_stride=1),
         keyframes=rows,
         mask_mode="Keyframes (by timestamp)",
+        mask_confirmed=False,
+        preview_ready=True,
+        stem="blocked",
+    )
+    assert job.output_path is None
+    assert "run_blocked" in job.log_text
+    job = run_video_job(
+        str(src),
+        "opencv",
+        Settings(max_workers=1, temporal_smoothing=True, keep_audio=True, frame_stride=1),
+        keyframes=rows,
+        mask_mode="Keyframes (by timestamp)",
         mask_confirmed=True,
         preview_ready=True,
         stem="moving",

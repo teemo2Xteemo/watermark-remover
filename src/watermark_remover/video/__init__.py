@@ -13,10 +13,3 @@ __all__ = [
     "read_frame_at",
     "target_frame_size",
 ]
-
-__all__ = [
-    "VideoProcessor",
-    "capped_max_workers",
-    "encode_video",
-    "extract_frames",
-]

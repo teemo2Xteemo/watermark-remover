@@ -13,7 +13,9 @@ from watermark_remover.config import Settings
 from watermark_remover.exceptions import InputValidationError, MaskError
 from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.ui.app import (
+    VideoJobResult,
     accept_ui_candidate,
+    allowed_output_quality_labels,
     bgr_to_rgb,
     candidates_to_labels,
     cuda_available,
@@ -33,6 +35,7 @@ from watermark_remover.ui.app import (
     rgb_to_bgr,
     run_image_job,
     run_video_job,
+    stream_video_run,
     template_preview_from_file,
     ui_mask_to_uint8,
 )
@@ -628,9 +631,10 @@ def test_is_video_run_enabled_static_and_keyframes() -> None:
     assert is_video_run_enabled("Static (all frames)", mask, False, True, []) is False
     assert is_video_run_enabled("Static (all frames)", mask, True, False, []) is False
     rows = [{"t": 0.0, "mask": mask}, {"t": 1.0, "mask": mask}]
-    assert is_video_run_enabled("Keyframes (by timestamp)", None, False, True, rows) is True
-    assert is_video_run_enabled("Keyframes (by timestamp)", None, False, False, rows) is False
-    assert is_video_run_enabled("Keyframes (by timestamp)", None, False, True, []) is False
+    assert is_video_run_enabled("Keyframes (by timestamp)", None, True, True, rows) is True
+    assert is_video_run_enabled("Keyframes (by timestamp)", None, False, True, rows) is False
+    assert is_video_run_enabled("Keyframes (by timestamp)", None, True, False, rows) is False
+    assert is_video_run_enabled("Keyframes (by timestamp)", None, True, True, []) is False
 
 
 def test_downsample_rgb_caps_long_side() -> None:
@@ -675,3 +679,75 @@ def test_ui_video_tab_has_no_process_all_batch_control() -> None:
     assert "Apply Inpainting" in video_chunk
     video_layout = video_chunk.split("input_file.upload", 1)[0]
     assert "Process All" not in video_layout
+    assert "confirm the overlay" in video_layout
+
+
+def test_allowed_output_quality_labels_gates_on_ram() -> None:
+    unbounded = Settings(max_ram_mb=None, max_vram_mb=None, max_workers=1)
+    assert allowed_output_quality_labels(unbounded, 1920, 1080) == [
+        "Same as Source",
+        "1080p",
+        "720p",
+    ]
+    tight = Settings.model_construct(
+        **{**Settings(max_workers=1).model_dump(), "max_ram_mb": 12, "max_vram_mb": None}
+    )
+    labels = allowed_output_quality_labels(tight, 1920, 1080)
+    assert "720p" in labels
+    assert "Same as Source" not in labels
+    assert "1080p" not in labels
+
+
+def test_stream_video_run_yields_job_id_before_job_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    captured_id: dict[str, str] = {}
+
+    def fake_job(*_args: object, **kwargs: object) -> VideoJobResult:
+        captured_id["job_id"] = str(kwargs.get("job_id"))
+        on_ui_update = kwargs.get("on_ui_update")
+        started.set()
+        assert release.wait(timeout=2.0)
+        if callable(on_ui_update):
+            on_ui_update(percent=50, log_text="tick", status="Status: frame 1")
+        return VideoJobResult(
+            output_path="/tmp/out.mp4",
+            temp_dir="/tmp",
+            log_text="done",
+            percent=100,
+            job_id=str(kwargs.get("job_id")),
+            cancel_requested=False,
+            status="Status: done",
+        )
+
+    monkeypatch.setattr("watermark_remover.ui.app.run_video_job", fake_job)
+    token = {"requested": False}
+    gen = stream_video_run(
+        video_path="clip.mp4",
+        engine_name="opencv",
+        config=Settings(),
+        mask=None,
+        keyframes=[],
+        mask_mode="Static (all frames)",
+        mask_confirmed=True,
+        preview_ready=True,
+        stem="clip",
+        job_temp=None,
+        cancel_token=token,
+        job_id="11111111-1111-4111-8111-111111111111",
+    )
+    first = next(gen)
+    assert first[4] == "11111111-1111-4111-8111-111111111111"
+    assert first[3] == 0
+    assert first[0] is None
+    assert started.wait(timeout=2.0)
+    release.set()
+    rest = list(gen)
+    assert rest
+    assert rest[-1][0] == "/tmp/out.mp4"
+    assert rest[-1][3] == 100
+    assert captured_id["job_id"] == "11111111-1111-4111-8111-111111111111"
