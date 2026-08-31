@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     opencv_method: Literal["telea", "ns"] = "telea"
     max_workers: int = Field(default_factory=_cpu_count, ge=1)
     raft_enabled: bool = False
+    temporal_smoothing: bool = True
     tile_size: int = Field(
         default=512,
         ge=1,

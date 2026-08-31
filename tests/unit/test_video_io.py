@@ -16,7 +16,7 @@ from watermark_remover.engines.base import InpaintEngine
 from watermark_remover.exceptions import EngineError, ResourceLimitError
 from watermark_remover.io.video import VideoMetadata, probe_video
 from watermark_remover.masks.base import MaskProvider
-from watermark_remover.video.encode import encode_video
+from watermark_remover.video.encode import encode_video, find_ffmpeg
 from watermark_remover.video.extract import extract_frames
 from watermark_remover.video.processor import VideoProcessor, capped_max_workers
 
@@ -356,3 +356,31 @@ def test_cli_video_uses_stem_inpainted_output(tmp_path: Path, fixtures_dir: Path
         )
     assert result.exit_code == 0, result.output
     assert mocked.call_args.args[3].name == "scene_inpainted.mp4"
+
+
+def test_find_ffmpeg_prefers_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "watermark_remover.video.encode.shutil.which",
+        lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None,
+    )
+    monkeypatch.setattr(
+        "watermark_remover.video.encode._bundled_ffmpeg",
+        lambda: "/bundled/ffmpeg",
+    )
+    assert find_ffmpeg() == "/usr/bin/ffmpeg"
+
+
+def test_find_ffmpeg_falls_back_to_bundled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "watermark_remover.video.encode._bundled_ffmpeg",
+        lambda: "/bundled/ffmpeg",
+    )
+    assert find_ffmpeg() == "/bundled/ffmpeg"
+
+
+def test_find_ffmpeg_none_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda _name: None)
+    monkeypatch.setattr("watermark_remover.video.encode._bundled_ffmpeg", lambda: None)
+    assert find_ffmpeg() is None
+
