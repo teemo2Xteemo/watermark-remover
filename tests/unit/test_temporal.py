@@ -56,6 +56,7 @@ def _fake_encode(
     output: Path,
     fps: float,
     crf: int,
+    **_kwargs: object,
 ) -> None:
     del frames_dir, audio_src, fps, crf
     Path(output).write_bytes(b"ok")

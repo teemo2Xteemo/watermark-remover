@@ -71,6 +71,78 @@ def export_mask_json(path: Path, payload: dict[str, Any]) -> None:
     write_bytes_atomic(Path(path), data)
 
 
+def load_keyframes(path: Path, frame_hw: tuple[int, int]) -> list[tuple[float, np.ndarray]]:
+    src = Path(path)
+    if not src.is_file():
+        raise MaskError(f"keyframes file does not exist: {src.name}")
+    try:
+        payload = json.loads(src.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MaskError(f"invalid keyframes JSON: {src.name}") from exc
+    if not isinstance(payload, dict):
+        raise MaskError("keyframes JSON must be an object")
+    version = payload.get("schema_version")
+    if not isinstance(version, int) or version != _SUPPORTED_SCHEMA:
+        raise MaskError(f"unsupported keyframes schema_version: {version!r}")
+    rows = payload.get("keyframes")
+    if not isinstance(rows, list) or not rows:
+        raise MaskError("keyframes must be a non-empty list")
+    loaded: list[tuple[float, np.ndarray]] = []
+    frame_h, frame_w = int(frame_hw[0]), int(frame_hw[1])
+    for index, item in enumerate(rows):
+        if not isinstance(item, dict):
+            raise MaskError(f"keyframe {index} must be an object")
+        raw_t = item.get("t")
+        if not isinstance(raw_t, (int, float)):
+            raise MaskError(f"keyframe {index} t must be a number")
+        mask_ref = item.get("mask_ref")
+        if not isinstance(mask_ref, str) or not mask_ref:
+            raise MaskError(f"keyframe {index} mask_ref must be a filename")
+        png_path = _sibling_png(src, mask_ref)
+        mask = load_mask_png(png_path)
+        if mask.shape != (frame_h, frame_w):
+            mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+            mask = validate_mask_array(mask)
+        loaded.append((float(raw_t), mask))
+    return loaded
+
+
+def export_keyframes(
+    path: Path,
+    keyframes: list[tuple[float, np.ndarray]],
+    stem: str,
+) -> Path:
+    if not keyframes:
+        raise MaskError("at least one keyframe is required")
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    safe_stem = Path(stem).name or "video"
+    refs: list[dict[str, Any]] = []
+    dest_dir = dest.parent.resolve()
+    for index, (t, mask) in enumerate(keyframes):
+        png_name = f"{safe_stem}.kf.{index}.png"
+        png_path = (dest_dir / png_name).resolve()
+        if png_path.parent != dest_dir:
+            raise MaskError("refusing path outside keyframes dir")
+        export_mask_png(png_path, mask)
+        refs.append({"t": float(t), "mask_ref": png_name})
+    body = {"schema_version": _SUPPORTED_SCHEMA, "keyframes": refs}
+    data = json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
+    write_bytes_atomic(dest, data)
+    return dest
+
+
+def _sibling_png(json_path: Path, mask_ref: str) -> Path:
+    name = Path(mask_ref).name
+    if not name or name in {".", ".."} or Path(name).suffix.lower() != ".png":
+        raise MaskError(f"mask_ref must be a sibling PNG filename, got {mask_ref!r}")
+    dest_dir = json_path.parent.resolve()
+    candidate = (dest_dir / name).resolve()
+    if candidate.parent != dest_dir:
+        raise MaskError("mask_ref must be a sibling file")
+    return candidate
+
+
 def mask_to_polygon_payload(mask: np.ndarray) -> dict[str, Any]:
     binary = validate_mask_array(mask)
     height, width = binary.shape

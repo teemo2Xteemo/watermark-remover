@@ -18,12 +18,15 @@ def encode_video(
     output: Path,
     fps: float,
     crf: int,
+    *,
+    keep_audio: bool = True,
 ) -> None:
     """Mux numbered PNG frames + original audio into `output`.
 
-    Audio is stream-copied (`-c:a copy`). If the source has no audio track, the
-    optional map is skipped and the file is video-only. If copy fails because the
-    codec is incompatible with the output container, audio is re-encoded as a fallback.
+    Audio is stream-copied (`-c:a copy`) when `keep_audio` is True. If the source
+    has no audio track, the optional map is skipped and the file is video-only.
+    If copy fails because the codec is incompatible with the output container,
+    audio is re-encoded as a fallback. When `keep_audio` is False, audio is omitted.
     """
     if not _list_frame_files(Path(frames_dir)):
         raise EngineError(f"no frames to encode in {Path(frames_dir).name}")
@@ -43,10 +46,13 @@ def encode_video(
         crf=crf,
         vcodec=vcodec,
         audio_codec="copy",
+        keep_audio=keep_audio,
     )
     completed = _run_ffmpeg(copy_cmd)
     if completed.returncode == 0:
         return
+    if not keep_audio:
+        raise EngineError(_ffmpeg_error(completed))
 
     log = structlog.get_logger("watermark_remover")
     log.info(
@@ -63,6 +69,7 @@ def encode_video(
         crf=crf,
         vcodec=vcodec,
         audio_codec=_audio_fallback_codec(dest.suffix),
+        keep_audio=True,
     )
     retried = _run_ffmpeg(retry_cmd)
     if retried.returncode != 0:
@@ -135,6 +142,7 @@ def _build_cmd(
     crf: int,
     vcodec: str,
     audio_codec: str,
+    keep_audio: bool,
 ) -> list[str]:
     fps_s = _format_fps(fps)
     args = [
@@ -149,23 +157,34 @@ def _build_cmd(
         "0",
         "-i",
         str(frames_dir / _FRAME_PATTERN),
-        "-i",
-        str(audio_src),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0?",
-        "-c:v",
-        vcodec,
-        "-crf",
-        str(int(crf)),
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        fps_s,
-        "-c:a",
-        audio_codec,
     ]
+    if keep_audio:
+        args.extend(
+            [
+                "-i",
+                str(audio_src),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0?",
+            ]
+        )
+    else:
+        args.extend(["-map", "0:v:0", "-an"])
+    args.extend(
+        [
+            "-c:v",
+            vcodec,
+            "-crf",
+            str(int(crf)),
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            fps_s,
+        ]
+    )
+    if keep_audio:
+        args.extend(["-c:a", audio_codec])
     if output.suffix.lower() in {".mp4", ".mov"}:
         args.extend(["-movflags", "+faststart"])
     args.append(str(output))

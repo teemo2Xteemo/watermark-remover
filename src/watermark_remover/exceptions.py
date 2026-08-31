@@ -15,3 +15,7 @@ class EngineError(Exception):
 
 class ResourceLimitError(Exception):
     """RAM/VRAM/worker cap would be exceeded — CLI exit 3."""
+
+
+class ProcessingCancelled(Exception):
+    """In-flight job was cancelled. Not a CLI exit mapping."""

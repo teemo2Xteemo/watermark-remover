@@ -13,12 +13,12 @@ import pytest
 from watermark_remover.cli import app
 from watermark_remover.config import Settings
 from watermark_remover.engines.base import InpaintEngine
-from watermark_remover.exceptions import EngineError, ResourceLimitError
+from watermark_remover.exceptions import EngineError, ProcessingCancelled, ResourceLimitError
 from watermark_remover.io.video import VideoMetadata, probe_video
 from watermark_remover.masks.base import MaskProvider
 from watermark_remover.video.encode import encode_video, find_ffmpeg
-from watermark_remover.video.extract import extract_frames
-from watermark_remover.video.processor import VideoProcessor, capped_max_workers
+from watermark_remover.video.extract import extract_frames, read_first_frame
+from watermark_remover.video.processor import VideoProcessor, capped_max_workers, target_frame_size
 
 _FPS = 10.0
 _SIZE = (32, 24)  # width, height
@@ -212,6 +212,7 @@ def test_resource_limit_skipped_when_max_ram_mb_unbounded(
         output: Path,
         fps: float,
         crf: int,
+        **_kwargs: object,
     ) -> None:
         del frames_dir, audio_src, fps, crf
         Path(output).write_bytes(b"ok")
@@ -307,6 +308,7 @@ def test_progress_callback_invoked(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         output: Path,
         fps: float,
         crf: int,
+        **_kwargs: object,
     ) -> None:
         del frames_dir, audio_src, fps, crf
         Path(output).write_bytes(b"ok")
@@ -383,4 +385,110 @@ def test_find_ffmpeg_none_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda _name: None)
     monkeypatch.setattr("watermark_remover.video.encode._bundled_ffmpeg", lambda: None)
     assert find_ffmpeg() is None
+
+
+def test_encode_video_omits_audio_when_keep_audio_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_00000000.png").write_bytes(b"png")
+    audio_src = tmp_path / "src.mp4"
+    audio_src.write_bytes(b"src")
+    output = tmp_path / "out.mp4"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"silent")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda name: name)
+    monkeypatch.setattr("watermark_remover.video.encode.subprocess.run", fake_run)
+    encode_video(frames_dir, audio_src, output, fps=10.0, crf=23, keep_audio=False)
+    assert calls
+    cmd = calls[0]
+    assert "-an" in cmd
+    assert "1:a:0?" not in cmd
+
+
+def test_target_frame_size_never_upscales() -> None:
+    settings = Settings(output_quality="720p")
+    assert target_frame_size(640, 480, settings) == (640, 480)
+    down = target_frame_size(1920, 1080, Settings(output_quality="720p"))
+    assert down[1] == 720
+    assert down[0] == 1280
+    source = target_frame_size(1920, 1080, Settings(output_quality="source"))
+    assert source == (1920, 1080)
+
+
+def test_read_first_frame_does_not_yield_all(tmp_path: Path) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=6)
+    frame = read_first_frame(src)
+    assert frame.shape == (24, 32, 3)
+    assert frame.dtype == np.uint8
+
+
+def test_processor_honors_frame_stride(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=6)
+    dest = tmp_path / "out.mp4"
+    seen: list[int] = []
+    encode_fps: list[float] = []
+
+    class _CountEngine(InpaintEngine):
+        def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+            del mask
+            return image
+
+    class _IdxMask(MaskProvider):
+        def get_mask(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
+            seen.append(frame_idx)
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+
+    def fake_encode(
+        frames_dir: Path,
+        audio_src: Path,
+        output: Path,
+        fps: float,
+        crf: int,
+        **_kwargs: object,
+    ) -> None:
+        del frames_dir, audio_src, crf
+        encode_fps.append(fps)
+        Path(output).write_bytes(b"ok")
+
+    monkeypatch.setattr("watermark_remover.video.processor.encode_video", fake_encode)
+    VideoProcessor(Settings(max_workers=1, temporal_smoothing=False, frame_stride=2)).process(
+        src, _IdxMask(), _CountEngine(), dest
+    )
+    assert seen == [0, 2, 4]
+    assert encode_fps[0] == pytest.approx(5.0)
+
+
+def test_processor_cancel_stops_and_cleans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=4)
+    dest = tmp_path / "out.mp4"
+    token = {"requested": False}
+
+    class _FlipEngine(InpaintEngine):
+        def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+            del mask
+            token["requested"] = True
+            return image
+
+    def fake_encode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("encode should not run after cancel")
+
+    monkeypatch.setattr("watermark_remover.video.processor.encode_video", fake_encode)
+    with pytest.raises(ProcessingCancelled):
+        VideoProcessor(Settings(max_workers=1, temporal_smoothing=False)).process(
+            src, _StaticMask(), _FlipEngine(), dest, cancel_token=token
+        )
+    assert not dest.exists()
+    assert not dest.with_name(f"{dest.stem}.tmp{dest.suffix}").exists()
 
