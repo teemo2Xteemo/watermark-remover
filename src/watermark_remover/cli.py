@@ -5,13 +5,14 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 import structlog
 import typer
 
 from watermark_remover.config import Settings, get_settings
+from watermark_remover.engines.registry import get_engine
 from watermark_remover.exceptions import (
     EngineError,
     InputValidationError,
@@ -22,11 +23,15 @@ from watermark_remover.image_processor import ImageProcessor
 from watermark_remover.io.image import read_image, write_image_atomic
 from watermark_remover.io.validate import (
     default_output_path,
+    is_video_path,
     refuse_overwrite_unless_flag,
     validate_input_path,
     validate_resolution_limits,
     validate_size_limits,
 )
+from watermark_remover.io.video import probe_video
+from watermark_remover.masks.base import validate_mask_coverage
+from watermark_remover.masks.manual import ManualMaskProvider
 from watermark_remover.masks.serialize import (
     export_mask_json,
     export_mask_png,
@@ -34,6 +39,7 @@ from watermark_remover.masks.serialize import (
     load_mask_png,
     mask_to_polygon_payload,
 )
+from watermark_remover.video.processor import VideoProcessor
 
 EngineName = Literal["opencv", "lama", "auto"]
 
@@ -107,6 +113,21 @@ def _run(
     output_path = output if output is not None else default_output_path(validated_input)
     refuse_overwrite_unless_flag(validated_input, output_path, overwrite)
 
+    if is_video_path(validated_input):
+        result_path = _run_video(
+            validated_input=validated_input,
+            mask_path=mask_path,
+            engine=engine,
+            output_path=output_path,
+            allow_empty_mask=allow_empty_mask,
+            allow_full_mask=allow_full_mask,
+            export_mask=export_mask,
+            settings=settings,
+            log=log,
+        )
+        log.info("job_end", engine=engine, output_path=result_path.name)
+        return result_path
+
     image = read_image(validated_input)
     mask = _load_mask(mask_path, (int(image.shape[0]), int(image.shape[1])))
 
@@ -129,14 +150,68 @@ def _run(
 
     write_image_atomic(output_path, result)
     if export_mask:
-        stem = validated_input.stem
-        export_dir = output_path.parent
-        export_mask_png(export_dir / f"{stem}.mask.png", mask)
-        export_mask_json(export_dir / f"{stem}.mask.json", mask_to_polygon_payload(mask))
-        log.info("mask_exported", output_path=f"{stem}.mask.png")
+        _export_mask_sidecars(validated_input, output_path, mask, log)
 
     log.info("job_end", engine=engine, output_path=output_path.name)
     return output_path
+
+
+def _run_video(
+    *,
+    validated_input: Path,
+    mask_path: Path,
+    engine: EngineName,
+    output_path: Path,
+    allow_empty_mask: bool,
+    allow_full_mask: bool,
+    export_mask: bool,
+    settings: Settings,
+    log: Any,
+) -> Path:
+    meta = probe_video(validated_input)
+    mask = _load_mask(mask_path, (meta.height, meta.width))
+    validate_mask_coverage(
+        mask,
+        allow_empty_mask=allow_empty_mask,
+        allow_full_mask=allow_full_mask,
+    )
+    provider = ManualMaskProvider(mask)
+    inpaint_engine = get_engine(engine, mask, settings)
+
+    def progress(**kwargs: object) -> None:
+        log.debug("video_progress", **kwargs)
+
+    started = time.perf_counter()
+    result_path = VideoProcessor(settings).process(
+        validated_input,
+        provider,
+        inpaint_engine,
+        output_path,
+        progress=progress,
+    )
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    log.info(
+        "inpaint_done",
+        engine=engine,
+        frame_idx=None,
+        duration_ms=round(duration_ms, 2),
+    )
+    if export_mask:
+        _export_mask_sidecars(validated_input, output_path, mask, log)
+    return result_path
+
+
+def _export_mask_sidecars(
+    validated_input: Path,
+    output_path: Path,
+    mask: np.ndarray,
+    log: Any,
+) -> None:
+    stem = validated_input.stem
+    export_dir = output_path.parent
+    export_mask_png(export_dir / f"{stem}.mask.png", mask)
+    export_mask_json(export_dir / f"{stem}.mask.json", mask_to_polygon_payload(mask))
+    log.info("mask_exported", output_path=f"{stem}.mask.png")
 
 
 @app.callback(invoke_without_command=True)
@@ -144,7 +219,7 @@ def main(
     ctx: typer.Context,
     input_path: Annotated[
         Path | None,
-        typer.Option("--input", help="Input image (JPG, PNG, WEBP)"),
+        typer.Option("--input", help="Input image (JPG, PNG, WEBP) or video (MP4, MOV, WEBM)"),
     ] = None,
     mask: Annotated[
         Path | None,

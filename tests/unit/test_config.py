@@ -30,9 +30,7 @@ def test_settings_tile_size_from_env(tmp_path: Path) -> None:
     assert settings.tile_overlap == 16
 
 
-def test_settings_loads_toml_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_settings_loads_toml_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = tmp_path / "config.toml"
     config.write_text("crf = 18\nmax_input_bytes = 4096\n", encoding="utf-8")
     monkeypatch.setenv("WATERMARK_REMOVER_CONFIG", str(config))
@@ -41,3 +39,9 @@ def test_settings_loads_toml_config(
     settings = Settings(_env_file=None)
     assert settings.crf == 18
     assert settings.max_input_bytes == 4096
+
+
+def test_max_workers_capped_at_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("watermark_remover.config._cpu_count", lambda: 2)
+    settings = Settings(max_workers=128)
+    assert settings.max_workers == 2

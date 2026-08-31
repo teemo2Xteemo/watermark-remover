@@ -13,12 +13,14 @@ from watermark_remover.exceptions import InputValidationError, ResourceLimitErro
 from watermark_remover.io.image import read_image, write_bytes_atomic, write_image_atomic
 from watermark_remover.io.validate import (
     default_output_path,
+    is_video_path,
     probe_image_dimensions,
     refuse_overwrite_unless_flag,
     validate_input_path,
     validate_resolution_limits,
     validate_size_limits,
 )
+from watermark_remover.io.video import VideoMetadata
 
 
 def _write_png(path: Path, image: np.ndarray) -> None:
@@ -94,6 +96,17 @@ def test_default_output_path_uses_stem_inpainted() -> None:
     assert default_output_path(path) == Path("clip_inpainted.png")
 
 
+def test_default_output_path_preserves_video_suffix() -> None:
+    assert default_output_path(Path("clip.mp4")) == Path("clip_inpainted.mp4")
+
+
+def test_validate_input_path_accepts_video_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"not-decoded-here")
+    assert validate_input_path(path) == path
+    assert is_video_path(path)
+
+
 def test_probe_png_dimensions_from_header(tmp_path: Path) -> None:
     src = tmp_path / "huge.png"
     _header_only_png(src, 12000, 8000)
@@ -112,6 +125,27 @@ def test_huge_resolution_allowed_when_unbounded(tmp_path: Path) -> None:
     src = tmp_path / "huge.png"
     _header_only_png(src, 20000, 20000)
     validate_resolution_limits(src, Settings(max_ram_mb=None))
+
+
+def test_video_working_set_rejected_when_ram_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        "watermark_remover.io.video.probe_video",
+        lambda _path: VideoMetadata(
+            fps=10.0,
+            width=20000,
+            height=20000,
+            duration=1.0,
+            codec="h264",
+            frame_count=2,
+            has_audio=False,
+        ),
+    )
+    with pytest.raises(ResourceLimitError):
+        validate_resolution_limits(src, Settings(max_ram_mb=1, max_workers=8))
 
 
 def test_tiny_resolution_roundtrip(tmp_path: Path) -> None:

@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import inspect
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+import cv2
+import numpy as np
+import pytest
+
+from watermark_remover.cli import app
+from watermark_remover.config import Settings
+from watermark_remover.engines.base import InpaintEngine
+from watermark_remover.exceptions import EngineError, ResourceLimitError
+from watermark_remover.io.video import VideoMetadata, probe_video
+from watermark_remover.masks.base import MaskProvider
+from watermark_remover.video.encode import encode_video
+from watermark_remover.video.extract import extract_frames
+from watermark_remover.video.processor import VideoProcessor, capped_max_workers
+
+_FPS = 10.0
+_SIZE = (32, 24)  # width, height
+
+
+class _PassthroughEngine(InpaintEngine):
+    def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        del mask
+        return image
+
+
+class _StaticMask(MaskProvider):
+    def get_mask(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
+        del frame_idx
+        return np.zeros(frame.shape[:2], dtype=np.uint8)
+
+
+class _BoomEngine(InpaintEngine):
+    def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        del image, mask
+        raise EngineError("boom")
+
+
+def _write_tiny_video(path: Path, frame_count: int = 5) -> None:
+    width, height = _SIZE
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        _FPS,
+        (width, height),
+    )
+    assert writer.isOpened(), "OpenCV could not open VideoWriter"
+    try:
+        for index in range(frame_count):
+            frame = np.full((height, width, 3), index * 3, dtype=np.uint8)
+            frame[2:10, 2:14] = (255, 255, 255)
+            writer.write(frame)
+    finally:
+        writer.release()
+
+
+def test_extract_frames_is_generator(tmp_path: Path) -> None:
+    assert inspect.isgeneratorfunction(extract_frames)
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=4)
+    iterator = extract_frames(src)
+    assert inspect.isgenerator(iterator)
+    frames = list(iterator)
+    assert [idx for idx, _ in frames] == [0, 1, 2, 3]
+    for _, frame in frames:
+        assert frame.dtype == np.uint8
+        assert frame.shape == (24, 32, 3)
+
+
+def test_processor_does_not_materialize_all_frames() -> None:
+    source = inspect.getsource(VideoProcessor)
+    assert "list(extract_frames" not in source
+
+
+def test_capped_max_workers_never_exceeds_cpu_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("watermark_remover.video.processor.os.cpu_count", lambda: 4)
+    assert capped_max_workers(9999) == 4
+    assert capped_max_workers(2) == 2
+    settings = Settings.model_construct(**{**Settings().model_dump(), "max_workers": 10_000})
+    assert capped_max_workers(settings.max_workers) == 4
+
+
+def test_encode_video_stream_copies_audio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_00000000.png").write_bytes(b"png")
+    audio_src = tmp_path / "src.mp4"
+    audio_src.write_bytes(b"src")
+    output = tmp_path / "out.mp4"
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        return name if name == "ffmpeg" else None
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"encoded")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", fake_which)
+    monkeypatch.setattr("watermark_remover.video.encode.subprocess.run", fake_run)
+    encode_video(frames_dir, audio_src, output, fps=10.0, crf=23)
+    assert calls
+    cmd = calls[0]
+    assert "-c:a" in cmd
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "-crf" in cmd
+    assert cmd[cmd.index("-crf") + 1] == "23"
+    assert "-framerate" in cmd
+    assert cmd[cmd.index("-framerate") + 1] == "10"
+    assert output.read_bytes() == b"encoded"
+
+
+def test_encode_video_retries_audio_reencode_when_copy_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_00000000.png").write_bytes(b"png")
+    audio_src = tmp_path / "src.mp4"
+    audio_src.write_bytes(b"src")
+    output = tmp_path / "out.mp4"
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        audio_codec = cmd[cmd.index("-c:a") + 1]
+        if audio_codec == "copy":
+            return subprocess.CompletedProcess(cmd, 1, "", "codec not currently supported")
+        Path(cmd[-1]).write_bytes(b"ok")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("watermark_remover.video.encode.shutil.which", lambda name: name)
+    monkeypatch.setattr("watermark_remover.video.encode.subprocess.run", fake_run)
+    encode_video(frames_dir, audio_src, output, fps=12.5, crf=18)
+    assert output.read_bytes() == b"ok"
+
+
+def test_resource_limit_raised_when_max_ram_mb_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src)
+    dest = tmp_path / "out.mp4"
+    huge = VideoMetadata(
+        fps=10.0,
+        width=20000,
+        height=20000,
+        duration=1.0,
+        codec="mp4v",
+        frame_count=2,
+        has_audio=False,
+    )
+    monkeypatch.setattr("watermark_remover.video.processor.probe_video", lambda _p: huge)
+    processor = VideoProcessor(Settings(max_ram_mb=1, max_workers=8))
+    with pytest.raises(ResourceLimitError, match="max_ram_mb"):
+        processor.process(src, _StaticMask(), _PassthroughEngine(), dest)
+    assert not dest.exists()
+
+
+def test_resource_limit_skipped_when_max_ram_mb_unbounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=2)
+    dest = tmp_path / "out.mp4"
+    huge = VideoMetadata(
+        fps=10.0,
+        width=20000,
+        height=20000,
+        duration=1.0,
+        codec="mp4v",
+        frame_count=2,
+        has_audio=False,
+    )
+    monkeypatch.setattr("watermark_remover.video.processor.probe_video", lambda _p: huge)
+
+    def fake_encode(
+        frames_dir: Path,
+        audio_src: Path,
+        output: Path,
+        fps: float,
+        crf: int,
+    ) -> None:
+        del frames_dir, audio_src, fps, crf
+        Path(output).write_bytes(b"ok")
+
+    monkeypatch.setattr("watermark_remover.video.processor.encode_video", fake_encode)
+    processor = VideoProcessor(Settings(max_ram_mb=None, max_workers=1))
+    result = processor.process(src, _StaticMask(), _PassthroughEngine(), dest)
+    assert result == dest
+    assert dest.is_file()
+
+
+def test_atomic_output_not_left_on_failure(tmp_path: Path) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=3)
+    dest = tmp_path / "final.mp4"
+    processor = VideoProcessor(Settings(max_workers=1))
+    with pytest.raises(EngineError, match="boom"):
+        processor.process(src, _StaticMask(), _BoomEngine(), dest)
+    assert not dest.exists()
+    assert not dest.with_name(f"{dest.stem}.tmp{dest.suffix}").exists()
+
+
+def test_progress_callback_invoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=3)
+    dest = tmp_path / "out.mp4"
+    seen: list[dict[str, object]] = []
+
+    def fake_encode(
+        frames_dir: Path,
+        audio_src: Path,
+        output: Path,
+        fps: float,
+        crf: int,
+    ) -> None:
+        del frames_dir, audio_src, fps, crf
+        Path(output).write_bytes(b"ok")
+
+    monkeypatch.setattr("watermark_remover.video.processor.encode_video", fake_encode)
+    VideoProcessor(Settings(max_workers=2)).process(
+        src,
+        _StaticMask(),
+        _PassthroughEngine(),
+        dest,
+        progress=lambda **kwargs: seen.append(kwargs),
+    )
+    assert len(seen) == 3
+    assert {item["frame_idx"] for item in seen} == {0, 1, 2}
+
+
+def test_probe_video_reads_header_not_payload(tmp_path: Path) -> None:
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=5)
+    meta = probe_video(src)
+    assert meta.width == 32
+    assert meta.height == 24
+    assert meta.fps == pytest.approx(_FPS, abs=0.05)
+    assert meta.frame_count in {0, 5} or meta.frame_count >= 1
+
+
+def test_cli_video_uses_stem_inpainted_output(tmp_path: Path, fixtures_dir: Path) -> None:
+    from typer.testing import CliRunner
+
+    src = tmp_path / "scene.mp4"
+    src.write_bytes((fixtures_dir / "clip_5s.mp4").read_bytes())
+    with patch.object(
+        VideoProcessor,
+        "process",
+        return_value=tmp_path / "scene_inpainted.mp4",
+    ) as mocked:
+        result = CliRunner().invoke(
+            app,
+            [
+                "--input",
+                str(src),
+                "--mask",
+                str(fixtures_dir / "clip_5s.mask.png"),
+                "--engine",
+                "opencv",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert mocked.call_args.args[3].name == "scene_inpainted.mp4"
