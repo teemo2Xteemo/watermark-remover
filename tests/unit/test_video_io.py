@@ -387,6 +387,224 @@ def test_find_ffmpeg_none_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> N
     assert find_ffmpeg() is None
 
 
+def test_open_capture_missing_and_wrong_suffix(tmp_path: Path) -> None:
+    from watermark_remover.exceptions import InputValidationError
+    from watermark_remover.io.video import open_capture
+
+    with pytest.raises(InputValidationError, match="does not exist"):
+        open_capture(tmp_path / "missing.mp4")
+    still = tmp_path / "frame.png"
+    still.write_bytes(b"png")
+    with pytest.raises(InputValidationError, match="unsupported video format"):
+        open_capture(still)
+
+
+def test_parse_frame_rate_and_fourcc() -> None:
+    from watermark_remover.io.video import _fourcc_to_str, _parse_frame_rate
+
+    assert _parse_frame_rate(None) == 0.0
+    assert _parse_frame_rate("0/0") == 0.0
+    assert _parse_frame_rate("N/A") == 0.0
+    assert _parse_frame_rate("1/0") == 0.0
+    assert _parse_frame_rate("foo/bar") == 0.0
+    assert _parse_frame_rate("25") == 25.0
+    assert _parse_frame_rate("not-a-rate") == 0.0
+    assert _parse_frame_rate("30000/1001") == pytest.approx(30000 / 1001)
+    assert _fourcc_to_str(0) == "unknown"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    assert _fourcc_to_str(fourcc) == "mp4v"
+
+
+def test_ffprobe_metadata_parses_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from watermark_remover.io import video as video_mod
+
+    payload = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 64,
+                "height": 48,
+                "r_frame_rate": "10/1",
+                "nb_frames": "20",
+                "duration": "2.0",
+            },
+            {"codec_type": "audio", "codec_name": "aac"},
+        ],
+        "format": {"duration": "2.0"},
+    }
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["ffprobe"], 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(video_mod, "_find_ffprobe", lambda: "ffprobe")
+    monkeypatch.setattr(video_mod.subprocess, "run", fake_run)
+    info = video_mod._ffprobe_metadata(tmp_path / "clip.mp4")
+    assert info is not None
+    assert info.width == 64
+    assert info.height == 48
+    assert info.fps == pytest.approx(10.0)
+    assert info.has_audio is True
+    assert info.codec == "h264"
+    assert info.frame_count == 20
+    assert info.duration == pytest.approx(2.0)
+
+
+def test_ffprobe_metadata_uses_format_duration_when_stream_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from watermark_remover.io import video as video_mod
+
+    payload = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "vp9",
+                "width": 32,
+                "height": 24,
+                "r_frame_rate": "0/0",
+                "nb_frames": "bad",
+                "duration": "nope",
+            }
+        ],
+        "format": {"duration": "1.5"},
+    }
+
+    monkeypatch.setattr(video_mod, "_find_ffprobe", lambda: "ffprobe")
+    monkeypatch.setattr(
+        video_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["ffprobe"], 0, json.dumps(payload), ""
+        ),
+    )
+    info = video_mod._ffprobe_metadata(tmp_path / "clip.webm")
+    assert info is not None
+    assert info.duration == pytest.approx(1.5)
+    assert info.frame_count == 0
+    assert info.has_audio is False
+    assert info.fps == 0.0
+
+
+def test_ffprobe_metadata_none_when_missing_or_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from watermark_remover.io import video as video_mod
+
+    monkeypatch.setattr(video_mod, "_find_ffprobe", lambda: None)
+    assert video_mod._ffprobe_metadata(tmp_path / "clip.mp4") is None
+    monkeypatch.setattr(video_mod, "_find_ffprobe", lambda: "ffprobe")
+    monkeypatch.setattr(
+        video_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["ffprobe"], 1, "", "err"),
+    )
+    assert video_mod._ffprobe_metadata(tmp_path / "clip.mp4") is None
+    monkeypatch.setattr(
+        video_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["ffprobe"], 0, "not-json", ""),
+    )
+    assert video_mod._ffprobe_metadata(tmp_path / "clip.mp4") is None
+
+
+def test_probe_video_prefers_ffprobe_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from watermark_remover.io import video as video_mod
+
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=3)
+    monkeypatch.setattr(
+        video_mod,
+        "_ffprobe_metadata",
+        lambda _path: video_mod._FfprobeInfo(
+            fps=24.0,
+            width=32,
+            height=24,
+            duration=1.25,
+            codec="h264",
+            frame_count=30,
+            has_audio=True,
+        ),
+    )
+    meta = probe_video(src)
+    assert meta.fps == pytest.approx(24.0)
+    assert meta.codec == "h264"
+    assert meta.has_audio is True
+    assert meta.duration == pytest.approx(1.25)
+    assert meta.frame_count == 30
+
+
+def test_find_ffprobe_uses_path_then_ffmpeg_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from watermark_remover.io import video as video_mod
+
+    monkeypatch.setattr(
+        video_mod.shutil,
+        "which",
+        lambda name: "ffprobe" if name == "ffprobe" else None,
+    )
+    assert video_mod._find_ffprobe() == "ffprobe"
+
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffmpeg.write_bytes(b"x")
+    ffprobe.write_bytes(b"x")
+
+    def which(name: str) -> str | None:
+        if name == "ffmpeg":
+            return str(ffmpeg)
+        return None
+
+    monkeypatch.setattr(video_mod.shutil, "which", which)
+    assert video_mod._find_ffprobe() == str(ffprobe)
+
+
+def test_probe_video_rejects_invalid_dimensions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from watermark_remover.exceptions import InputValidationError
+    from watermark_remover.io import video as video_mod
+
+    src = tmp_path / "tiny.mp4"
+    _write_tiny_video(src, frame_count=1)
+    monkeypatch.setattr(
+        video_mod,
+        "_ffprobe_metadata",
+        lambda _path: video_mod._FfprobeInfo(
+            fps=0.0,
+            width=0,
+            height=0,
+            duration=0.0,
+            codec="",
+            frame_count=0,
+            has_audio=False,
+        ),
+    )
+
+    class _ZeroCapture:
+        def get(self, _prop: int) -> float:
+            return 0.0
+
+        def isOpened(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            return None
+
+    monkeypatch.setattr(video_mod.cv2, "VideoCapture", lambda _path: _ZeroCapture())
+    with pytest.raises(InputValidationError, match="invalid video dimensions"):
+        probe_video(src)
+
+
 def test_encode_video_omits_audio_when_keep_audio_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

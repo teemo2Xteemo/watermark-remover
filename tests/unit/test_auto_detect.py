@@ -267,3 +267,12 @@ def test_template_match_survives_work_image_downscale(
     assert candidates
     assert candidates[0].mask.shape == frame.shape[:2]
     assert _best_iou(candidates, gt) >= IOU_MIN
+
+
+def test_load_template_missing_and_bad_suffix(tmp_path: Path) -> None:
+    with pytest.raises(MaskError, match="does not exist"):
+        load_template(tmp_path / "nope.png")
+    txt = tmp_path / "logo.txt"
+    txt.write_text("x", encoding="utf-8")
+    with pytest.raises(MaskError, match="PNG/JPG/WEBP"):
+        load_template(txt)

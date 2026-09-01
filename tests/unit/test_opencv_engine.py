@@ -85,3 +85,61 @@ def test_image_processor_full_mask_raises() -> None:
     mask = np.full((8, 8), 255, dtype=np.uint8)
     with pytest.raises(MaskError, match="full-image mask"):
         ImageProcessor().process(image, mask, "opencv", Settings())
+
+
+def test_opencv_ns_process_shape_and_unmasked_pixels() -> None:
+    image = np.zeros((24, 24, 3), dtype=np.uint8)
+    image[:, :] = (15, 80, 160)
+    image[4:8, 4:8] = (200, 10, 10)
+    mask = np.zeros((24, 24), dtype=np.uint8)
+    mask[4:8, 4:8] = 255
+    out = OpenCVInpaintEngine(radius=3, method="ns").process(image, mask)
+    assert out.shape == image.shape
+    assert out.dtype == np.uint8
+    assert np.array_equal(out[mask == 0], image[mask == 0])
+
+
+def test_opencv_rejects_bad_radius_and_method() -> None:
+    with pytest.raises(EngineError, match="radius"):
+        OpenCVInpaintEngine(radius=0, method="telea")
+    with pytest.raises(EngineError, match="unknown OpenCV inpaint method"):
+        OpenCVInpaintEngine(radius=3, method="magic")  # type: ignore[arg-type]
+
+
+def test_opencv_rejects_wrong_image_and_mask_shape() -> None:
+    engine = OpenCVInpaintEngine(radius=3, method="telea")
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1, 1] = 255
+    with pytest.raises(EngineError, match="BGR uint8"):
+        engine.process(np.zeros((8, 8), dtype=np.uint8), mask)
+    with pytest.raises(MaskError, match="does not match"):
+        engine.process(np.zeros((8, 8, 3), dtype=np.uint8), np.zeros((4, 4), dtype=np.uint8))
+
+
+def test_opencv_wraps_cv2_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cv2
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise cv2.error("inpaint boom")
+
+    monkeypatch.setattr("watermark_remover.engines.opencv_engine.cv2.inpaint", boom)
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:4, 2:4] = 255
+    with pytest.raises(EngineError, match="OpenCV inpaint failed"):
+        OpenCVInpaintEngine(radius=3, method="telea").process(image, mask)
+
+
+def test_opencv_casts_non_uint8_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_inpaint(
+        image: np.ndarray, _mask: np.ndarray, _radius: float, _flags: int
+    ) -> np.ndarray:
+        return image.astype(np.float32)
+
+    monkeypatch.setattr("watermark_remover.engines.opencv_engine.cv2.inpaint", fake_inpaint)
+    image = np.full((8, 8, 3), 40, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1, 1] = 255
+    out = OpenCVInpaintEngine(radius=3, method="telea").process(image, mask)
+    assert out.dtype == np.uint8
+    assert out.shape == image.shape

@@ -318,3 +318,41 @@ def test_lama_cuda_provider_or_skip(fixtures_dir: Path) -> None:
     out = LaMaInpaintEngine(_stub_weights(fixtures_dir), "cuda").process(image, mask)
     assert out.shape == image.shape
     assert out.dtype == np.uint8
+
+
+def test_lama_invalid_tile_config_before_session(tmp_path: Path) -> None:
+    weights = tmp_path / "missing.onnx"
+    with pytest.raises(EngineError, match="tile_size"):
+        LaMaInpaintEngine(weights, "cpu", tile_size=0, tile_overlap=0)
+    with pytest.raises(EngineError, match="overlap must be >= 0"):
+        LaMaInpaintEngine(weights, "cpu", tile_size=16, tile_overlap=-1)
+    with pytest.raises(EngineError, match="smaller than tile_size"):
+        LaMaInpaintEngine(weights, "cpu", tile_size=16, tile_overlap=16)
+
+
+def test_lama_device_reports_cuda_when_provider_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
+    from watermark_remover.engines import registry
+
+    fake = types.SimpleNamespace(
+        get_available_providers=lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+    assert registry._lama_device() == "cuda"
+
+
+def test_resolved_engine_name_for_opencv_and_lama(fixtures_dir: Path) -> None:
+    from watermark_remover.engines.registry import resolved_engine_name
+
+    opencv = get_engine("opencv", np.zeros((4, 4), dtype=np.uint8), Settings())
+    assert resolved_engine_name(opencv) == "opencv"
+    lama = get_engine(
+        "lama",
+        np.zeros((4, 4), dtype=np.uint8),
+        Settings(lama_weights=_stub_weights(fixtures_dir)),
+    )
+    assert resolved_engine_name(lama) == "lama"

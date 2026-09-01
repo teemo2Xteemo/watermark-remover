@@ -586,7 +586,10 @@ def test_union_bbox_mask() -> None:
     assert int(out[0, 0]) == 0
 
 
+@pytest.mark.enable_socket
 def test_build_app_smoke() -> None:
+    # Gradio Blocks() starts an asyncio loop; on Windows that uses socketpair,
+    # not outbound network. pytest-socket blocks socketpair unless enabled.
     pytest.importorskip("gradio")
     from watermark_remover.ui.app import SECTION_TITLES, build_app
 

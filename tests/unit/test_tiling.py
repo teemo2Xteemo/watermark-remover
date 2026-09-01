@@ -5,7 +5,7 @@ import pytest
 
 from watermark_remover.engines.base import InpaintEngine
 from watermark_remover.engines.tiling import TiledInpaint
-from watermark_remover.exceptions import EngineError
+from watermark_remover.exceptions import EngineError, MaskError
 
 
 class _ConstantEngine(InpaintEngine):
@@ -127,3 +127,36 @@ def test_default_tile_size_512_splits_image_larger_than_tile() -> None:
     assert not np.isnan(out.astype(np.float64)).any()
     assert int(out.min()) >= 0
     assert int(out.max()) <= 255
+
+
+def test_tiling_rejects_invalid_tile_size_and_overlap() -> None:
+    with pytest.raises(EngineError, match="tile_size"):
+        TiledInpaint(tile_size=0, overlap=0)
+    with pytest.raises(EngineError, match="overlap must be >= 0"):
+        TiledInpaint(tile_size=16, overlap=-1)
+
+
+def test_tiling_rejects_wrong_image_and_mask() -> None:
+    tiled = TiledInpaint(tile_size=16, overlap=4)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1, 1] = 255
+    with pytest.raises(EngineError, match="BGR uint8"):
+        tiled.process(np.zeros((8, 8), dtype=np.uint8), mask, _IdentityEngine())
+    with pytest.raises(MaskError, match="does not match"):
+        tiled.process(
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            np.zeros((4, 4), dtype=np.uint8),
+            _IdentityEngine(),
+        )
+
+
+def test_tiling_rejects_engine_output_with_wrong_shape() -> None:
+    class _BadShape(InpaintEngine):
+        def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+            del image, mask
+            return np.zeros((2, 2, 3), dtype=np.uint8)
+
+    image = _gradient_image(40, 40)
+    mask = np.full((40, 40), 255, dtype=np.uint8)
+    with pytest.raises(EngineError, match="same shape as the tile"):
+        TiledInpaint(tile_size=16, overlap=4).process(image, mask, _BadShape())
