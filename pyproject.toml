@@ -22,6 +22,7 @@ dev = [
     "onnxruntime>=1.29",
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "pytest-socket>=0.7",
     "ruff>=0.5",
 ]
 ui = [
@@ -40,10 +41,38 @@ watermark-remover = "watermark_remover.cli:app"
 [tool.pytest.ini_options]
 pythonpath = ["src", "scripts"]
 testpaths = ["tests"]
+# Default run: no sockets, skip @slow/@gpu. Override markers with
+#   pytest -m gpu -o "addopts=--disable-socket --allow-unix-socket"
+# or disable coverage with --no-cov.
+addopts = [
+    "--disable-socket",
+    "--allow-unix-socket",
+    "-m",
+    "not slow and not gpu",
+    "--cov=watermark_remover.engines",
+    "--cov=watermark_remover.masks",
+    "--cov=watermark_remover.io",
+    "--cov-report=term-missing",
+    "--cov-fail-under=80",
+]
 markers = [
     "slow: long-running tests skipped in default CI",
     "gpu: requires CUDA",
+    "enable_socket: allow sockets (local asyncio/Gradio loop, not outbound HTTP)",
 ]
+
+[tool.coverage.run]
+branch = false
+source = [
+    "src/watermark_remover/engines",
+    "src/watermark_remover/masks",
+    "src/watermark_remover/io",
+]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_empty = true
 
 [tool.ruff]
 line-length = 100

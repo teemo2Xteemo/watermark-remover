@@ -277,16 +277,3 @@ def test_cli_ui_invokes_launch() -> None:
         result = runner.invoke(app, ["ui"])
     assert result.exit_code == 0, result.output
     mocked.assert_called_once()
-
-
-def test_processing_packages_do_not_import_http_clients() -> None:
-    root = Path(__file__).resolve().parents[2] / "src" / "watermark_remover"
-    forbidden = ("requests", "httpx", "urllib.request", "urllib3", "aiohttp")
-    skip_parts = {"ui"}
-    for path in root.rglob("*.py"):
-        if skip_parts.intersection(path.parts):
-            continue
-        text = path.read_text(encoding="utf-8")
-        for name in forbidden:
-            assert f"import {name}" not in text
-            assert f"from {name}" not in text
