@@ -2,7 +2,7 @@
 
 Công cụ xóa logo, chữ chìm, timestamp hoặc một vùng nhỏ trên **ảnh**. Tool chạy trên máy bạn, không cần tài khoản.
 
-Phiên bản hiện tại: **0.1.0**. Chỉ xử lý ảnh (JPG, PNG, WEBP). **Chưa xử lý video.**
+Phiên bản hiện tại: **0.1.1**. Chỉ xử lý ảnh (JPG, PNG, WEBP). **Chưa xử lý video.**
 
 ---
 
