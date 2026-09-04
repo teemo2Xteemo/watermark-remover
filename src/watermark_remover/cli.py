@@ -52,12 +52,14 @@ app = typer.Typer(
 
 
 def _configure_logging(job_id: str, level: str) -> None:
-    try:
-        sys.stderr.reconfigure(errors="replace")
-    except (AttributeError, OSError, ValueError):
-        pass
+    reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError, TypeError):
+            pass
     numeric = getattr(logging, level.upper(), logging.INFO)
-    shared = [
+    shared: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),

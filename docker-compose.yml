@@ -1,0 +1,36 @@
+# Local-only. Host publish is 127.0.0.1:7860 only (not 0.0.0.0).
+# GRADIO_SERVER_NAME=0.0.0.0 is container-internal so the mapped port can reach Gradio.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: watermark-remover:cpu
+    environment:
+      MODEL_DIR: /models
+      LAMA_WEIGHTS: /models/lama.onnx
+      GRADIO_SERVER_NAME: "0.0.0.0"
+    volumes:
+      - ./data/in:/input:ro
+      - ./data/out:/output
+      - ./models:/models:ro
+    ports:
+      - "127.0.0.1:7860:7860"
+
+  app-cuda:
+    profiles: ["cuda"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: watermark-remover:cuda
+    environment:
+      MODEL_DIR: /models
+      LAMA_WEIGHTS: /models/lama.onnx
+      GRADIO_SERVER_NAME: "0.0.0.0"
+    volumes:
+      - ./data/in:/input:ro
+      - ./data/out:/output
+      - ./models:/models:ro
+    ports:
+      - "127.0.0.1:7860:7860"
+    gpus: all

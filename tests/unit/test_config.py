@@ -53,3 +53,13 @@ def test_video_settings_defaults() -> None:
     assert settings.keep_audio is True
     assert settings.frame_stride == 1
     assert settings.temporal_smoothing is True
+    assert settings.gradio_server_name == "127.0.0.1"
+    assert settings.gradio_share is False
+
+
+def test_gradio_server_name_from_env(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GRADIO_SERVER_NAME=0.0.0.0\n", encoding="utf-8")
+    clear_settings_cache()
+    settings = Settings(_env_file=env_file)
+    assert settings.gradio_server_name == "0.0.0.0"

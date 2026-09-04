@@ -247,15 +247,18 @@ def test_parallel_progress_tracks_completion_not_submit_order(
     _write_tiny_video(src, frame_count=n_frames)
     dest = tmp_path / "out.mp4"
     seen: list[int] = []
+    started = threading.Barrier(n_frames, timeout=5.0)
 
     class _ReverseFinishEngine(InpaintEngine):
         def process(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
             frame_idx = int(mask[0, 0])
+            started.wait()
             time.sleep(0.05 * (n_frames - frame_idx))
             return image
 
+    monkeypatch.setattr("watermark_remover.video.processor.os.cpu_count", lambda: n_frames)
     monkeypatch.setattr("watermark_remover.video.processor.encode_video", _fake_encode_ok)
-    VideoProcessor(_settings(temporal_smoothing=False, max_workers=4)).process(
+    VideoProcessor(_settings(temporal_smoothing=False, max_workers=n_frames)).process(
         src,
         _IdxMask(),
         _ReverseFinishEngine(),

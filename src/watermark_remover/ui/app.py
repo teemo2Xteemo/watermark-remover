@@ -958,9 +958,11 @@ def run_video_job(
                 def _progress(**kwargs: object) -> None:
                     payload = {key: value for key, value in kwargs.items() if value is not None}
                     job_log.info("video_progress", job_id=job_id, engine=engine_name, **payload)
-                    if progress is not None and payload.get("percent") is not None:
-                        fraction = min(max(float(payload["percent"]) / 100.0, 0.0), 1.0)
-                        progress(fraction, desc=f"frame {payload.get('frame_idx')}")
+                    if progress is not None:
+                        raw_percent = payload.get("percent")
+                        if isinstance(raw_percent, (int, float)):
+                            fraction = min(max(float(raw_percent) / 100.0, 0.0), 1.0)
+                            progress(fraction, desc=f"frame {payload.get('frame_idx')}")
                     if on_ui_update is not None:
                         raw_percent = payload.get("percent")
                         percent_i = int(raw_percent) if isinstance(raw_percent, (int, float)) else 0
@@ -1106,8 +1108,10 @@ def stream_video_run(
 
 def _quality_setting(label: str | None) -> Literal["source", "1080p", "720p"]:
     mapped = _QUALITY_TO_SETTING.get(str(label or ""), "source")
-    if mapped in {"source", "1080p", "720p"}:
-        return mapped
+    if mapped == "1080p":
+        return "1080p"
+    if mapped == "720p":
+        return "720p"
     return "source"
 
 
@@ -1192,8 +1196,12 @@ def _editor_value(rgb: np.ndarray, mask: np.ndarray | None) -> dict[str, Any]:
 
 
 def _engine_name(raw: str | None) -> EngineName:
-    if raw in {"opencv", "lama", "auto"}:
-        return raw
+    if raw == "opencv":
+        return "opencv"
+    if raw == "lama":
+        return "lama"
+    if raw == "auto":
+        return "auto"
     return "opencv"
 
 
