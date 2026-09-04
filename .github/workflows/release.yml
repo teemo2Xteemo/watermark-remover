@@ -1,0 +1,72 @@
+# Cut a GitHub Release by merging into `releases` after bumping
+# [project].version in pyproject.toml. Creates tag vX.Y.Z, updates
+# CHANGELOG.md, and publishes the GitHub Release. Does not download models.
+name: Release
+
+on:
+  push:
+    branches: [releases]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch tags
+        run: git fetch --tags --force origin
+
+      - name: Read version and gate
+        id: gate
+        run: |
+          VERSION="$(python scripts/prepare_release.py --print-version)"
+          TAG="$(python scripts/prepare_release.py --print-tag)"
+          STATE="$(python scripts/prepare_release.py --gate)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+          echo "Release gate: version=${VERSION} tag=${TAG} state=${STATE}"
+          if [ "${STATE}" = "already_released" ]; then
+            echo "Tag ${TAG} already exists. Bump [project].version in pyproject.toml to cut a new release."
+          fi
+
+      - name: Write changelog
+        if: steps.gate.outputs.state == 'new'
+        run: python scripts/prepare_release.py --write-changelog
+
+      - name: Commit changelog, push tag, create GitHub Release
+        if: steps.gate.outputs.state == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.gate.outputs.version }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md already up to date for ${TAG}"
+          else
+            git add CHANGELOG.md
+            git commit -m "chore: changelog for ${TAG}"
+          fi
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "HEAD:releases"
+          git push origin "${TAG}"
+          python scripts/prepare_release.py --print-notes > /tmp/release-notes.md
+          gh release create "${TAG}" \
+            --verify-tag \
+            --title "${TAG}" \
+            --notes-file /tmp/release-notes.md
