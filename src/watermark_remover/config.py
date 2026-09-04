@@ -98,7 +98,10 @@ class Settings(BaseSettings):
     output_quality: Literal["source", "1080p", "720p"] = "source"
     keep_audio: bool = True
     frame_stride: int = Field(default=1, ge=1)
-    gradio_server_name: str = "127.0.0.1"
+    gradio_server_name: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("GRADIO_SERVER_NAME", "gradio_server_name"),
+    )
     gradio_share: bool = False
 
     @model_validator(mode="after")

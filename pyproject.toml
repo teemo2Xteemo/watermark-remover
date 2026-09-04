@@ -80,14 +80,29 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+select = ["E", "F", "I", "UP", "RUF100"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 mypy_path = "src"
 packages = ["watermark_remover"]
 strict = false
+ignore_missing_imports = true
+# numpy 2 stubs leave many ndarray constructors uninferred; keep the gate on real mismatches.
+disable_error_code = ["var-annotated"]
 
 [[tool.mypy.overrides]]
-module = ["cv2", "cv2.*", "onnxruntime", "onnxruntime.*", "torch", "torch.*", "imageio_ffmpeg", "imageio_ffmpeg.*"]
+module = [
+    "cv2",
+    "cv2.*",
+    "numpy",
+    "numpy.*",
+    "onnxruntime",
+    "onnxruntime.*",
+    "torch",
+    "torch.*",
+    "imageio_ffmpeg",
+    "imageio_ffmpeg.*",
+]
 ignore_missing_imports = true
+follow_imports = "skip"

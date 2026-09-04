@@ -22,10 +22,11 @@ coverage.xml
 coverage.json
 
 # Model weights (downloaded locally; not committed)
-models/*.pth
-models/*.pt
-models/*.onnx
-models/*.ckpt
+models/
+
+# Compose bind-mounts for local media
+data/in/
+data/out/
 
 # OS / editor
 .DS_Store

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -278,7 +279,7 @@ def _pad_hwc(
         )
         return padded, top, left
     can_reflect = top < height and bottom < height and left < width and right < width
-    mode = "symmetric" if can_reflect else "edge"
+    mode: Literal["symmetric", "edge"] = "symmetric" if can_reflect else "edge"
     padded = np.pad(array, ((top, bottom), (left, right), (0, 0)), mode=mode)
     return padded, top, left
 

@@ -94,7 +94,10 @@ class AutoDetectMaskProvider(MaskProvider):
         self._threshold_bias = min(self._threshold_bias + 0.05, 0.3)
 
     def _template_candidates(self, frame: np.ndarray) -> list[MaskCandidate]:
-        templ_bgr, alpha = _split_template(self._template)
+        template = self._template
+        if template is None:
+            return []
+        templ_bgr, alpha = _split_template(template)
         height, width = frame.shape[:2]
         work, factor = _working_copy(frame)
         work_h, work_w = work.shape[:2]
