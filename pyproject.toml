@@ -95,6 +95,8 @@ disable_error_code = ["var-annotated"]
 module = [
     "cv2",
     "cv2.*",
+    "gradio",
+    "gradio.*",
     "numpy",
     "numpy.*",
     "onnxruntime",
